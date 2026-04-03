@@ -35,6 +35,101 @@ const BACKDROP = 'BACKDROP'
 
 type AerialPerspectiveNodeScope = typeof CAMERA | typeof BACKDROP
 
+type CloudShadowSampleFn = (
+  positionWorldNode: Node<'vec3'>,
+  normalWorldNode?: Node<'vec3'> | null
+) => Node<'float'>
+
+export interface CloudsAerialProviders {
+  sampleCloudShadow: CloudShadowSampleFn | null
+  shadowLengthNode: Node<'vec2'> | null
+}
+
+function resolveCloudShadowSample(provider: unknown): CloudShadowSampleFn | null {
+  if (provider == null) {
+    return null
+  }
+  if (
+    typeof (provider as { sample?: unknown }).sample === 'function'
+  ) {
+    return (provider as { sample: CloudShadowSampleFn }).sample
+  }
+  return null
+}
+
+function resolveCloudShadowLengthNode(
+  provider: unknown,
+  uvNode: Node<'vec2'>
+): Node<'vec2'> | null {
+  if (provider == null) {
+    return null
+  }
+  if (
+    typeof (
+      provider as {
+        sampleShadowLength?: unknown
+      }
+    ).sampleShadowLength === 'function'
+  ) {
+    const shadowLength = (
+      provider as {
+        sampleShadowLength: (uvNode?: Node<'vec2'>) => Node<'float'>
+      }
+    )
+      .sampleShadowLength(uvNode)
+      .toConst()
+    return vec2(shadowLength, 0)
+  }
+  if (
+    typeof (provider as { getTextureNode?: unknown }).getTextureNode ===
+    'function'
+  ) {
+    const textureNode = (
+      provider as {
+        getTextureNode: () => unknown
+      }
+    ).getTextureNode()
+    if (
+      textureNode != null &&
+      typeof (textureNode as { sample?: unknown }).sample === 'function'
+    ) {
+      const shadowLength = (
+        textureNode as {
+          sample: (uvNode: Node<'vec2'>) => Node<'vec4'>
+        }
+      )
+        .sample(uvNode)
+        .r.toConst()
+      return vec2(shadowLength, 0)
+    }
+  }
+  if ((provider as { isNode?: boolean }).isNode === true) {
+    return provider as Node<'vec2'>
+  }
+  return null
+}
+
+export function resolveCloudsAerialProviders(
+  builder: NodeBuilder,
+  uvNode: Node<'vec2'> = viewportUV
+): CloudsAerialProviders {
+  const cloudsShadowProvider =
+    typeof builder.context.getCloudsShadow === 'function'
+      ? builder.context.getCloudsShadow()
+      : null
+  const cloudsShadowLengthProvider =
+    typeof builder.context.getCloudsShadowLength === 'function'
+      ? builder.context.getCloudsShadowLength()
+      : null
+  return {
+    sampleCloudShadow: resolveCloudShadowSample(cloudsShadowProvider),
+    shadowLengthNode: resolveCloudShadowLengthNode(
+      cloudsShadowLengthProvider,
+      uvNode
+    )
+  }
+}
+
 export class AerialPerspectiveNode extends TempNode {
   static override get type(): string {
     return 'AerialPerspectiveNode'
@@ -82,6 +177,12 @@ export class AerialPerspectiveNode extends TempNode {
 
   override setup(builder: NodeBuilder): unknown {
     const atmosphereContext = getAtmosphereContext(builder)
+    const { sampleCloudShadow, shadowLengthNode: contextShadowLengthNode } =
+      resolveCloudsAerialProviders(builder)
+    const effectiveShadowLengthNode =
+      this.shadowLengthNode ?? contextShadowLengthNode ?? vec2(0)
+    const skyShadowLengthNode =
+      this.shadowLengthNode ?? contextShadowLengthNode ?? null
 
     const { worldToUnit } = atmosphereContext.parameters
     const {
@@ -94,8 +195,16 @@ export class AerialPerspectiveNode extends TempNode {
       altitudeCorrectionUnit
     } = atmosphereContext
 
-    const { colorNode, depthNode, normalNode, shadowLengthNode, skyNode } = this
+    const { colorNode, depthNode, normalNode, skyNode } = this
     const depth = depthNode.load(screenCoordinate).r.toConst()
+
+    if (this.skyNode != null) {
+      ;(
+        this.skyNode as {
+          shadowLengthNode?: Node<'vec2'> | null
+        }
+      ).shadowLengthNode = skyShadowLengthNode
+    }
 
     const getCameraPositionUnit = (): Node<'vec3'> => {
       if (this.scope === BACKDROP) {
@@ -203,6 +312,9 @@ export class AerialPerspectiveNode extends TempNode {
           normalECEF = positionUnit.normalize()
         }
         normalECEF = normalECEF.toConst()
+        const normalWorld = atmosphereContext.matrixECEFToWorld
+          .mul(vec4(normalECEF, 0))
+          .xyz.toConst()
 
         // Direct and indirect illuminance on the surface:
         const solarIlluminance = getSplitIlluminance(
@@ -210,8 +322,24 @@ export class AerialPerspectiveNode extends TempNode {
           normalECEF,
           sunDirectionECEF
         ).toConst()
+        let solarDirectIlluminance = solarIlluminance.get('direct')
+        if (sampleCloudShadow != null) {
+          const positionWorld = atmosphereContext.matrixECEFToWorld
+            .mul(
+              vec4(
+                positionUnit.sub(altitudeCorrectionUnit).div(worldToUnit),
+                1
+              )
+            )
+            .xyz
+          const cloudShadow = sampleCloudShadow(
+            positionWorld,
+            normalWorld
+          ).clamp(0, 1)
+          solarDirectIlluminance = solarDirectIlluminance.mul(cloudShadow)
+        }
         let illuminance = add(
-          solarIlluminance.get('direct'),
+          solarDirectIlluminance,
           solarIlluminance.get('indirect')
         )
         if (this.moonScattering) {
@@ -236,7 +364,7 @@ export class AerialPerspectiveNode extends TempNode {
       const solarLuminanceTransfer = getIndirectLuminanceToPoint(
         cameraPositionUnit.add(altitudeCorrectionUnit),
         positionUnit.add(altitudeCorrectionUnit),
-        shadowLengthNode ?? vec2(0),
+        effectiveShadowLengthNode,
         sunDirectionECEF
       ).toConst()
       const transmittance = solarLuminanceTransfer.get('transmittance')
@@ -247,7 +375,7 @@ export class AerialPerspectiveNode extends TempNode {
         const lunarLuminanceTransfer = getIndirectLuminanceToPoint(
           cameraPositionUnit.add(altitudeCorrectionUnit),
           positionUnit.add(altitudeCorrectionUnit),
-          shadowLengthNode ?? vec2(0),
+          effectiveShadowLengthNode,
           moonDirectionECEF
         ).toConst()
 

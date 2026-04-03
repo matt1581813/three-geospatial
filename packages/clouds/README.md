@@ -26,6 +26,47 @@ three postprocessing
 @react-three/fiber @react-three/postprocessing @react-three/drei
 ```
 
+## WebGPU entry
+
+An experimental WebGPU entry is available at `@takram/three-clouds/webgpu`.
+
+Implementation status, M1 acceptance notes, and M2 planning are tracked in
+[`docs/webgpu-clouds-status.md`](./docs/webgpu-clouds-status.md).
+
+```ts
+import { CloudsContext, clouds } from '@takram/three-clouds/webgpu'
+```
+
+The current WebGPU path is intentionally low-level and is designed to be used
+with `renderer.contextNode` together with `@takram/three-atmosphere/webgpu`.
+It currently provides:
+
+- `CloudsContext`
+- `CloudsNode`
+- `clouds(...)`
+- `CloudsShadowNode` / `cloudsShadow(...)`
+- `CloudsShadowLengthNode` / `cloudsShadowLength(...)`
+- `getCloudsContext(builder)`
+
+`CloudsNode` renders to MRT internally. In addition to the default color output,
+`cloudsNode.getTextureNode('transmittanceDepth')` exposes a packed auxiliary
+buffer with:
+
+- `r`: cloud alpha (`1 - transmittance`)
+- `g`: remaining transmittance
+- `b`: transmittance-weighted mean depth
+- `a`: accumulated transmittance weight
+
+The baseline WebGPU path keeps cloud marching at full resolution and does not
+depend on temporal history.
+
+Current limitations of the WebGPU path:
+
+- `AtmosphereContext` is required. Standalone fallback is not supported.
+- `ProceduralTexture` and `Procedural3DTexture` are still WebGL-only.
+- `/webgpu/r3f` helpers are not included yet.
+- WebGPU clouds are composed as nodes and do not integrate with `postprocessing`'s `EffectComposer` bridge.
+
 ## Usage
 
 ### Default clouds
@@ -207,7 +248,9 @@ This illustrates that greater total cloud layer height increases computational c
 
 - Introduce global cloud coverage and support rendering views from space.
 
-- Currently developed using GLSL. It does not use node-based TSL yet, and WebGPU is not supported, but both are planned.
+- The legacy WebGL path is still GLSL-based. A new experimental WebGPU path is
+  available under `@takram/three-clouds/webgpu`, but it does not yet cover the
+  full feature set of the WebGL implementation.
 
 # API
 

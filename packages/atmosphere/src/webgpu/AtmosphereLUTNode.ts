@@ -5,6 +5,7 @@ import {
   RGBAFormat,
   Texture
 } from 'three'
+import { hash } from 'three/src/nodes/core/NodeUtils.js'
 import {
   Node,
   NodeUpdateType,
@@ -108,6 +109,7 @@ export class AtmosphereLUTNode extends Node {
   }
 
   private currentVersion?: number
+  private currentSetupHash?: number
   private updating = false
   private disposeQueue: (() => void) | undefined
 
@@ -218,7 +220,12 @@ export class AtmosphereLUTNode extends Node {
       ? (this.textureType ?? FloatType)
       : HalfFloatType
     this.parameters.update()
-    this.textures.setup(this.parameters, textureType)
+    const nextSetupHash = hash(this.parameters.hash(), textureType)
+    if (this.currentSetupHash !== nextSetupHash) {
+      this.textures.setup(this.parameters, textureType)
+      this.currentSetupHash = nextSetupHash
+      this.currentVersion = undefined
+    }
 
     return super.setup(builder)
   }

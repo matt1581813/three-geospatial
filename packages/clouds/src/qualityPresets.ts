@@ -25,6 +25,10 @@ const values = {
     minDensity: 1e-5,
     minExtinction: 1e-5,
     minTransmittance: 1e-2,
+    hazeDensityScale: 3e-5,
+    hazeExponent: 1e-3,
+    hazeScatteringCoefficient: 0.9,
+    hazeAbsorptionCoefficient: 0.5,
 
     // Secondary raymarch
     maxIterationCountToGround: 3,

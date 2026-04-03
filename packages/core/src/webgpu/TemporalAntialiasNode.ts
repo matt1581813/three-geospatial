@@ -15,6 +15,7 @@ import {
   max,
   mix,
   screenCoordinate,
+  screenSize,
   screenUV,
   sqrt,
   step,
@@ -22,6 +23,7 @@ import {
   texture,
   textureSize,
   uniform,
+  vec2,
   vec3,
   vec4
 } from 'three/tsl'
@@ -87,6 +89,30 @@ interface PostProcessingContext {
   }
 }
 
+interface ProjectionMatrixController {
+  setProjectionMatrix?: (value: Matrix4 | null) => unknown
+  projectionMatrix?: Matrix4 | null
+}
+
+function setProjectionMatrix(
+  controller: ProjectionMatrixController,
+  value: Matrix4 | null
+): void {
+  if (typeof controller.setProjectionMatrix === 'function') {
+    controller.setProjectionMatrix(value)
+    return
+  }
+  controller.projectionMatrix = value
+}
+
+export function biasTemporalAlphaWithCurrentFrameWeight(
+  baseTemporalAlpha: number,
+  currentFrameWeight: number
+): number {
+  const weight = Math.min(Math.max(currentFrameWeight, 0), 1)
+  return Math.min(Math.max(baseTemporalAlpha * (1 - weight) + weight, 0), 1)
+}
+
 // Reference: https://github.com/playdeadgames/temporal
 const clipAABB = /*#__PURE__*/ FnLayout({
   name: 'clipAABB',
@@ -133,6 +159,38 @@ const varianceClipping = /*#__PURE__*/ FnVar(
 
     for (const [x, y] of varianceOffsets) {
       const neighbor = inputNode.load(coord.add(ivec2(x, y))).toConst()
+      moment1.addAssign(neighbor)
+      moment2.addAssign(neighbor.pow2())
+    }
+
+    const N = varianceOffsets.length + 1
+    const mean = moment1.div(N).toConst()
+    const variance = sqrt(moment2.div(N).sub(mean.pow2()).max(0))
+      .mul(gamma)
+      .toConst()
+    const minColor = mean.sub(variance).toConst()
+    const maxColor = mean.add(variance).toConst()
+
+    return clipAABB(mean.clamp(minColor, maxColor), history, minColor, maxColor)
+  }
+)
+
+const varianceClippingSampled = /*#__PURE__*/ FnVar(
+  (
+    inputNode: TextureNode,
+    uv: Node<'vec2'>,
+    current: Node<'vec4'>,
+    history: Node<'vec4'>,
+    gamma: Node<'float'>
+  ): Node<'vec4'> => {
+    const texelSize = vec2(1).div(vec2(textureSize(inputNode))).toConst()
+    const moment1 = current.toVar()
+    const moment2 = current.pow2().toVar()
+
+    for (const [x, y] of varianceOffsets) {
+      const neighbor = inputNode
+        .sample(uv.add(vec2(x, y).mul(texelSize)))
+        .toConst()
       moment1.addAssign(neighbor)
       moment2.addAssign(neighbor.pow2())
     }
@@ -235,6 +293,7 @@ export class TemporalAntialiasNode extends TempNode {
   inputNode: TextureNode
   depthNode: TextureNode
   velocityNode: TextureNode
+  currentFrameMaskNode?: TextureNode | null
   camera: SupportedCamera
 
   temporalAlpha = uniform(0.05)
@@ -243,6 +302,9 @@ export class TemporalAntialiasNode extends TempNode {
   depthError = uniform(0.001)
 
   debugShowRejection = false
+  allowBackgroundHistory = false
+  disableDepthRejection = false
+  disableVelocityRejection = false
 
   private readonly textureNode: TextureNode
 
@@ -259,22 +321,26 @@ export class TemporalAntialiasNode extends TempNode {
   private readonly historyNode = texture(this.historyRT.texture)
   private readonly previousDepthNode = texture(emptyDepthTexture)
   private readonly originalProjectionMatrix = new Matrix4()
+  private readonly projectionMatrixController: ProjectionMatrixController
   private jitterIndex = 0
 
   constructor(
+    projectionMatrixController: ProjectionMatrixController,
     inputNode: TextureNode,
     depthNode: TextureNode,
     velocityNode: TextureNode,
-    camera: Camera
+    camera: Camera,
+    currentFrameMaskNode: TextureNode | null = null
   ) {
     super('vec4')
     this.updateBeforeType = NodeUpdateType.FRAME
     this.resolveMaterial.name = 'TemporalAntialias_resolve'
     this.mesh.name = 'TemporalAntialias'
-
+    this.projectionMatrixController = projectionMatrixController
     this.inputNode = inputNode
     this.depthNode = depthNode
     this.velocityNode = velocityNode
+    this.currentFrameMaskNode = currentFrameMaskNode
     if (!isSupportedCamera(camera)) {
       throw new Error('The provided camera is not supported.')
     }
@@ -284,7 +350,13 @@ export class TemporalAntialiasNode extends TempNode {
   }
 
   override customCacheKey(): number {
-    return hashValues(this.camera.id, this.debugShowRejection)
+    return hashValues(
+      this.camera.id,
+      this.debugShowRejection,
+      this.allowBackgroundHistory,
+      this.disableDepthRejection,
+      this.disableVelocityRejection
+    )
   }
 
   private createRenderTarget(name?: string): RenderTarget {
@@ -325,12 +397,19 @@ export class TemporalAntialiasNode extends TempNode {
     this.needsClearHistory = false
   }
 
+  invalidateHistory(): void {
+    this.needsClearHistory = true
+  }
+
   private setViewOffset(width: number, height: number): void {
     // Store the unjittered projection matrix:
     const { camera } = this
     camera.updateProjectionMatrix()
     this.originalProjectionMatrix.copy(camera.projectionMatrix)
-    highpVelocity.setProjectionMatrix(this.originalProjectionMatrix)
+    setProjectionMatrix(
+      this.projectionMatrixController,
+      this.originalProjectionMatrix
+    )
 
     const offset = haltonOffsets[this.jitterIndex]
     const dx = offset.x - 0.5
@@ -341,7 +420,7 @@ export class TemporalAntialiasNode extends TempNode {
   private clearViewOffset(): void {
     // Reset the projection matrix modified in setViewOffset():
     this.camera.clearViewOffset()
-    highpVelocity.setProjectionMatrix(null)
+    setProjectionMatrix(this.projectionMatrixController, null)
 
     // setViewOffset() can be called multiple times in a frame. Increment the
     // jitter index here.
@@ -433,6 +512,54 @@ export class TemporalAntialiasNode extends TempNode {
     return Fn(() => {
       const coord = ivec2(screenCoordinate)
       const uv = screenUV
+      const outputColor = this.inputNode.load(coord).toVar()
+
+      if (this.currentFrameMaskNode != null) {
+        // WebGL-like temporal upscale path:
+        // - Use per-pixel current-frame mask
+        // - Reproject with velocity
+        // - No extra velocity/depth confidence rejection
+        const inputSize = vec2(textureSize(this.inputNode)).toConst()
+        const lowCoord = ivec2(
+          vec2(coord).add(0.5).mul(inputSize).div(screenSize)
+        )
+          .clamp(ivec2(0), ivec2(inputSize).sub(1))
+          .toConst()
+        outputColor.assign(this.inputNode.load(lowCoord))
+        const velocity = this.velocityNode
+          .load(coord)
+          .xyz // Velocity is already encoded in UV offset for masked temporal upscale
+          .toConst()
+        const prevUV = uv.sub(velocity.xy).toConst()
+        const uvWeight = and(
+          prevUV.greaterThanEqual(0).all(),
+          prevUV.lessThanEqual(1).all()
+        ).toFloat()
+        const currentFrameWeight = this.currentFrameMaskNode
+          .load(coord)
+          .r.saturate()
+          .toConst()
+
+        If(currentFrameWeight.lessThan(1).and(uvWeight.greaterThan(0)), () => {
+          const historyColor = texture(this.historyNode, prevUV)
+          const clippedColor = varianceClippingSampled(
+            this.inputNode,
+            uv,
+            outputColor,
+            historyColor,
+            this.varianceGamma
+          )
+          outputColor.assign(mix(clippedColor, outputColor, currentFrameWeight))
+        }).Else(() => {
+          if (this.debugShowRejection) {
+            If(currentFrameWeight.lessThan(1).and(uvWeight.equal(0)), () => {
+              outputColor.assign(vec3(1, 0, 0))
+            })
+          }
+        })
+
+        return outputColor
+      }
 
       const currentDepth = getCurrentDepth(this.depthNode, coord).toConst()
       const closestCoord = currentDepth.get('closestCoord')
@@ -444,14 +571,18 @@ export class TemporalAntialiasNode extends TempNode {
         .toConst()
 
       // Discards texels with velocity greater than the threshold:
-      const velocityConfidence = velocityUVW.xy
-        .length()
-        .div(this.velocityThreshold)
-        .oneMinus()
-        .saturate()
+      const velocityConfidence = this.disableVelocityRejection
+        ? float(1)
+        : velocityUVW.xy
+            .length()
+            .div(this.velocityThreshold)
+            .oneMinus()
+            .saturate()
 
       const prevUV = uv.sub(velocityUVW.xy).toConst()
-      const prevDepth = getPreviousDepth(prevUV)
+      const prevDepth = this.disableDepthRejection
+        ? float(0)
+        : getPreviousDepth(prevUV)
 
       // TODO: Add gather() in TextureNode and use it:
       const expectedDepth = renderer.logarithmicDepthBuffer
@@ -462,10 +593,12 @@ export class TemporalAntialiasNode extends TempNode {
           )
         : closestDepth
 
-      const depthConfidence = step(
-        expectedDepth.add(velocityUVW.z),
-        prevDepth.add(this.depthError)
-      )
+      const depthConfidence = this.disableDepthRejection
+        ? float(1)
+        : step(
+            expectedDepth.add(velocityUVW.z),
+            prevDepth.add(this.depthError)
+          )
 
       const confidence = velocityConfidence.mul(depthConfidence)
 
@@ -475,9 +608,10 @@ export class TemporalAntialiasNode extends TempNode {
       ).toFloat()
 
       // Don't apply TAA on the background:
-      const depthWeight = closestDepth.notEqual(1).toFloat()
+      const depthWeight = this.allowBackgroundHistory
+        ? float(1)
+        : closestDepth.notEqual(1).toFloat()
 
-      const outputColor = this.inputNode.load(coord).toVar()
       If(uvWeight.mul(depthWeight).mul(confidence).greaterThan(0), () => {
         const historyColor = texture(this.historyNode, prevUV)
         const clippedColor = varianceClipping(
@@ -515,16 +649,30 @@ export class TemporalAntialiasNode extends TempNode {
       const size = builder.renderer.getDrawingBufferSize(sizeScratch)
       this.setViewOffset(size.width, size.height)
     }
-    if (builder.context.renderPipeline != null) {
+    if (
+      builder.context.renderPipeline != null &&
+      this.currentFrameMaskNode == null
+    ) {
       const { context } = builder.context
         .renderPipeline as RenderPipelineContext
-      context.onBeforeRenderPipeline = onBeforeRenderPipeline
+      const previous = context.onBeforeRenderPipeline
+      context.onBeforeRenderPipeline = () => {
+        previous?.()
+        onBeforeRenderPipeline()
+      }
       this.needsSyncRenderPipeline = true
     }
-    if (builder.context.postProcessing != null) {
+    if (
+      builder.context.postProcessing != null &&
+      this.currentFrameMaskNode == null
+    ) {
       const { context } = builder.context
         .postProcessing as PostProcessingContext
-      context.onBeforePostProcessing = onBeforeRenderPipeline
+      const previous = context.onBeforePostProcessing
+      context.onBeforePostProcessing = () => {
+        previous?.()
+        onBeforeRenderPipeline()
+      }
       this.needsSyncRenderPipeline = true
     }
 
@@ -549,57 +697,58 @@ export class TemporalAntialiasNode extends TempNode {
 
 /**
  * @deprecated Function signature has been changed. Use
- *   temporalAntialias(inputNode, depthNode, velocityNode, camera)
+ *   temporalAntialias(inputNode, depthNode, velocityNode, camera, currentFrameMaskNode)
  */
 export function temporalAntialias(
-  velocityNodeImmutable: unknown
+  projectionMatrixController: ProjectionMatrixController
 ): (
   inputNode: Node,
   depthNode: TextureNode,
   velocityNode: TextureNode,
-  camera: Camera
+  camera: Camera,
+  currentFrameMaskNode?: TextureNode | null
 ) => TemporalAntialiasNode
 
 export function temporalAntialias(
   inputNode: Node,
   depthNode: TextureNode,
   velocityNode: TextureNode,
-  camera: Camera
+  camera: Camera,
+  currentFrameMaskNode?: TextureNode | null
 ): TemporalAntialiasNode
 
 export function temporalAntialias(...args: any[]): any {
   if (args.length === 1) {
+    const [projectionMatrixController] = args as [ProjectionMatrixController]
     return (
       inputNode: Node,
       depthNode: TextureNode,
       velocityNode: TextureNode,
-      camera: Camera
+      camera: Camera,
+      currentFrameMaskNode: TextureNode | null = null
     ): TemporalAntialiasNode =>
       new TemporalAntialiasNode(
+        projectionMatrixController,
         convertToTexture(inputNode, { name: 'TemporalAntialias_input' }),
         depthNode,
         velocityNode,
-        camera
+        camera,
+        currentFrameMaskNode
       )
   }
-  const [inputNode, depthNode, velocityNode, camera] = args
+  const [
+    inputNode,
+    depthNode,
+    velocityNode,
+    camera,
+    currentFrameMaskNode = null
+  ] = args
   return new TemporalAntialiasNode(
+    highpVelocity,
     convertToTexture(inputNode, { name: 'TemporalAntialias_input' }),
     depthNode,
     velocityNode,
-    camera
+    camera,
+    currentFrameMaskNode
   )
 }
-
-// export const temporalAntialias = (
-//   inputNode: Node,
-//   depthNode: TextureNode,
-//   velocityNode: TextureNode,
-//   camera: Camera
-// ): TemporalAntialiasNode =>
-//   new TemporalAntialiasNode(
-//     convertToTexture(inputNode),
-//     depthNode,
-//     velocityNode,
-//     camera
-//   )
