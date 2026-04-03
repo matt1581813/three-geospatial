@@ -2,7 +2,15 @@
 
 import type { Args, ArgTypes, StoryFn, StoryObj } from '@storybook/react-vite'
 import { atom, useSetAtom, type SetStateAction } from 'jotai'
-import { memo, useEffect, useMemo, type FC } from 'react'
+import shallowEqual from 'shallowequal'
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type FC
+} from 'react'
 import { useArgs } from 'storybook/preview-api'
 
 import { StoryContext } from '../helpers/StoryContext'
@@ -62,7 +70,7 @@ export function createStory<Props, TArgs extends Args>(
       }, [updateArgs])
 
       const argsAtom = useMemo(() => {
-        const primitive = atom({})
+        const primitive = atom(args)
         return atom(
           get => get(primitive),
           (get, set, value: SetStateAction<Args>) => {
@@ -74,7 +82,15 @@ export function createStory<Props, TArgs extends Args>(
         )
       }, [])
 
-      useSetAtom(argsAtom)(args)
+      const setArgsAtom = useSetAtom(argsAtom)
+      const previousArgsRef = useRef(args)
+      useLayoutEffect(() => {
+        if (shallowEqual(previousArgsRef.current, args)) {
+          return
+        }
+        previousArgsRef.current = args
+        setArgsAtom(args)
+      }, [args, setArgsAtom])
 
       const context = useMemo(
         () => ({ argsAtom, updateArgs }),

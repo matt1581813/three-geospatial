@@ -28,7 +28,8 @@ function useRenderingControls(
       lightShafts: false,
       shapeDetail: false,
       turbulence: false,
-      haze: false
+      haze: false,
+      enableWebGPU: false
     }),
     { collapsed: true }
   )
@@ -44,15 +45,33 @@ function useRenderingControls(
       lightShafts: effect.lightShafts,
       shapeDetail: effect.shapeDetail,
       turbulence: effect.turbulence,
-      haze: effect.haze
+      haze: effect.haze,
+      enableWebGPU: false
     })
     initRef.current = true
   }, [effect, qualityPreset, set])
 
+  useEffect(() => {
+    if (!params.enableWebGPU) {
+      return
+    }
+    const url = new URL(window.location.href)
+    // WebGL storybook runs on 13315 and WebGPU storybook on 13316 in this repo setup.
+    if (url.port === '13315') {
+      url.port = '13316'
+    }
+    url.search = ''
+    url.searchParams.set('id', 'cloud--web-gl-basic-aligned')
+    url.searchParams.set('viewMode', 'story')
+    url.searchParams.set('args', 'forceWebGL:false')
+    window.location.assign(url.toString())
+  }, [params.enableWebGPU])
+
   if (!initRef.current) {
     return {}
   }
-  return params
+  const { enableWebGPU: _enableWebGPU, ...cloudsParams } = params
+  return cloudsParams
 }
 
 function useScatteringControls(
