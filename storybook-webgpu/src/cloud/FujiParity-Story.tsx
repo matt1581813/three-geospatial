@@ -52,6 +52,7 @@ import {
 import type { CloudsQualityPreset } from '@takram/three-clouds'
 import { Clouds } from '@takram/three-clouds/r3f'
 import { Ellipsoid, Geodetic, PointOfView, radians } from '@takram/three-geospatial'
+import { EllipsoidMesh } from '@takram/three-geospatial/r3f'
 import { Dithering, LensFlare } from '@takram/three-geospatial-effects/r3f'
 
 import type { StoryFC } from '../components/createStory'
@@ -70,6 +71,20 @@ import {
 } from '../controls/toneMappingControls'
 import { useControl } from '../hooks/useControl'
 import type { PointOfViewProps } from '../hooks/usePointOfView'
+import {
+  applyCameraMatrixToCamera,
+  cameraMatricesApproximatelyEqual,
+  readCameraFromUrl,
+  serializeCameraComponents,
+  readCameraMatrixFromUrl,
+  serializeCameraMatrixElements,
+  writeCameraToUrl
+} from '../helpers/cameraMatrixURL'
+import {
+  applyPointOfViewToCamera,
+  pointOfViewsApproximatelyEqual,
+  readPointOfViewFromCamera
+} from '../helpers/cameraPointOfView'
 import { Story as WebGPUCloudStory } from './Cloud-Story'
 import {
   FUJI_PARITY_ANCHOR_LATITUDE,
@@ -87,6 +102,7 @@ interface FujiParityArgs extends LocalDateArgs, ToneMappingArgs, RendererArgs {
   coverage: number
   qualityPreset: CloudsQualityPreset
   resolutionScale: number
+  taaEnabled: boolean
   temporalUpscale: boolean
   temporalUpscaleScale: number
   animateClouds: boolean
@@ -248,13 +264,24 @@ const LegacyWebGLGlobeAndControls: FC<{ apiKey?: string }> = ({ apiKey }) => {
   )
 }
 
-const LegacyWebGLFujiScene: FC<PointOfViewProps> = ({
+interface FujiCameraSyncProps {
+  cameraMatrixElements?: number[] | null
+  cameraComponents?: number[] | null
+  onCameraMatrixChange?: (elements: number[]) => void
+  onCameraComponentsChange?: (components: number[]) => void
+}
+
+const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
   longitude,
   latitude,
   height = 0,
   heading,
   pitch,
-  distance
+  distance,
+  cameraMatrixElements = null,
+  cameraComponents = null,
+  onCameraMatrixChange,
+  onCameraComponentsChange
 }) => {
   const camera = useThree(({ camera }) => camera)
   const renderer = useThree(({ gl }) => gl)
@@ -303,6 +330,19 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps> = ({
     SHAPE_DETAIL_VELOCITY,
     cloudMotionScale
   )
+  const appliedCameraMatrixSignatureRef = useRef<string>('')
+  const emittedCameraMatrixSignatureRef = useRef<string>('')
+  const appliedCameraComponentsSignatureRef = useRef<string>('')
+  const emittedCameraComponentsSignatureRef = useRef<string>('')
+  const fallbackOrbitTarget = useMemo(
+    () =>
+      new Geodetic(
+        radians(cameraComponents?.[0] ?? longitude),
+        radians(cameraComponents?.[1] ?? latitude),
+        cameraComponents?.[2] ?? height
+      ).toECEF(new Vector3()).toArray() as [number, number, number],
+    [cameraComponents, height, latitude, longitude]
+  )
 
   const motionDate = useLocalDateControls(longitude)
   useFrame(() => {
@@ -328,9 +368,72 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps> = ({
     camera.updateMatrixWorld()
   }, [camera, distance, heading, height, latitude, longitude, pitch])
 
+  useLayoutEffect(() => {
+    if (cameraComponents == null || cameraComponents.length !== 6) {
+      return
+    }
+    const signature = serializeCameraComponents(cameraComponents)
+    if (signature === appliedCameraComponentsSignatureRef.current) {
+      return
+    }
+    if (!applyPointOfViewToCamera(camera, cameraComponents)) {
+      return
+    }
+    appliedCameraComponentsSignatureRef.current = signature
+    emittedCameraComponentsSignatureRef.current = signature
+  }, [camera, cameraComponents])
+
+  useLayoutEffect(() => {
+    if (cameraComponents != null && cameraComponents.length === 6) {
+      return
+    }
+    if (cameraMatrixElements == null || cameraMatrixElements.length !== 16) {
+      return
+    }
+    const signature = serializeCameraMatrixElements(cameraMatrixElements)
+    if (signature === appliedCameraMatrixSignatureRef.current) {
+      return
+    }
+    applyCameraMatrixToCamera(camera, cameraMatrixElements)
+    appliedCameraMatrixSignatureRef.current = signature
+    emittedCameraMatrixSignatureRef.current = signature
+  }, [camera, cameraMatrixElements])
+
+  useFrame(() => {
+    if (onCameraComponentsChange != null) {
+      const components = readPointOfViewFromCamera(camera)
+      if (components != null) {
+        const signature = serializeCameraComponents(components)
+        if (signature !== emittedCameraComponentsSignatureRef.current) {
+          emittedCameraComponentsSignatureRef.current = signature
+          appliedCameraComponentsSignatureRef.current = signature
+          onCameraComponentsChange(components.slice(0, 6))
+        }
+      }
+    }
+    if (onCameraMatrixChange != null) {
+      const elements = camera.matrixWorld.elements.slice(0, 16)
+      const signature = serializeCameraMatrixElements(elements)
+      if (signature !== emittedCameraMatrixSignatureRef.current) {
+        emittedCameraMatrixSignatureRef.current = signature
+        appliedCameraMatrixSignatureRef.current = signature
+        onCameraMatrixChange(elements)
+      }
+    }
+  })
+
   return (
     <Atmosphere ref={atmosphereRef} correctAltitude={correctAltitude}>
-      <LegacyWebGLGlobeAndControls apiKey={apiKey} />
+      {apiKey != null ? (
+        <LegacyWebGLGlobeAndControls apiKey={apiKey} />
+      ) : (
+        <>
+          <EllipsoidMesh args={[Ellipsoid.WGS84.radii, 192, 96]}>
+            <meshBasicMaterial color='#6b695e' />
+          </EllipsoidMesh>
+          <OrbitControls enableDamping target={fallbackOrbitTarget} />
+        </>
+      )}
       <EffectComposer multisampling={0} enableNormalPass>
         <Fragment
           key={JSON.stringify([
@@ -412,7 +515,7 @@ const StableLegacyCanvas: FC<{
   )
 }
 
-const WebGLFujiStory: FC<PointOfViewProps> = props => {
+const WebGLFujiStory: FC<PointOfViewProps & FujiCameraSyncProps> = props => {
   const pixelRatio = useControl(({ pixelRatio }: FujiParityArgs) => pixelRatio)
 
   return (
@@ -432,17 +535,72 @@ const WebGLFujiStory: FC<PointOfViewProps> = props => {
 export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
   const backend = useControl(({ backend }: FujiParityArgs) => backend)
   const cloudPresetMode = useCloudPresetMode()
+  const [cameraComponents, setCameraComponents] = useState<number[] | null>(
+    () => readCameraFromUrl()
+  )
+  const [cameraMatrixElements, setCameraMatrixElements] = useState<number[] | null>(
+    () => readCameraMatrixFromUrl()
+  )
   const [resolvedBackend, setResolvedBackend] = useState<Backend | null>(backend)
   const pendingBackendRef = useRef<Backend | null>(null)
+  const lastCameraMatrixSignatureRef = useRef(
+    cameraMatrixElements != null
+      ? serializeCameraMatrixElements(cameraMatrixElements)
+      : ''
+  )
+  const lastCameraComponentsSignatureRef = useRef(
+    cameraComponents != null ? serializeCameraComponents(cameraComponents) : ''
+  )
   const orbitTarget = useMemo(
     () =>
       getFujiTargetWorld(
-        props.longitude,
-        props.latitude,
-        props.height ?? 0
+        cameraComponents?.[0] ?? props.longitude,
+        cameraComponents?.[1] ?? props.latitude,
+        cameraComponents?.[2] ?? props.height ?? 0
       ),
-    [props.height, props.latitude, props.longitude]
+    [cameraComponents, props.height, props.latitude, props.longitude]
   )
+  const handleCameraComponentsChange = useCallback((components: number[]) => {
+    if (components.length !== 6) {
+      return
+    }
+    const signature = serializeCameraComponents(components)
+    if (signature === lastCameraComponentsSignatureRef.current) {
+      return
+    }
+    lastCameraComponentsSignatureRef.current = signature
+    setCameraComponents(current => {
+      if (pointOfViewsApproximatelyEqual(current, components)) {
+        return current ?? components
+      }
+      return components.slice(0, 6)
+    })
+    writeCameraToUrl(components)
+  }, [])
+
+  const handleCameraMatrixChange = useCallback((elements: number[]) => {
+    if (elements.length !== 16) {
+      return
+    }
+    const signature = serializeCameraMatrixElements(elements)
+    if (signature === lastCameraMatrixSignatureRef.current) {
+      return
+    }
+    lastCameraMatrixSignatureRef.current = signature
+    setCameraMatrixElements(current => {
+      if (cameraMatricesApproximatelyEqual(current, elements)) {
+        return current ?? elements
+      }
+      return elements.slice(0, 16)
+    })
+  }, [])
+
+  useLayoutEffect(() => {
+    if (cameraComponents == null) {
+      return
+    }
+    writeCameraToUrl(cameraComponents)
+  }, [cameraComponents, resolvedBackend])
 
   useLayoutEffect(() => {
     if (backend === resolvedBackend || pendingBackendRef.current === backend) {
@@ -467,7 +625,16 @@ export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
   }
 
   if (resolvedBackend === 'webgl') {
-    return <WebGLFujiStory key='backend-webgl' {...props} />
+    return (
+      <WebGLFujiStory
+        key='backend-webgl'
+        {...props}
+        cameraMatrixElements={cameraMatrixElements}
+        cameraComponents={cameraComponents}
+        onCameraMatrixChange={handleCameraMatrixChange}
+        onCameraComponentsChange={handleCameraComponentsChange}
+      />
+    )
   }
 
   return (
@@ -484,6 +651,10 @@ export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
       updateArgs={() => undefined}
       enableOrbitControls
       orbitControlsTarget={orbitTarget}
+      cameraMatrixElements={cameraMatrixElements}
+      cameraComponents={cameraComponents}
+      onCameraMatrixChange={handleCameraMatrixChange}
+      onCameraComponentsChange={handleCameraComponentsChange}
       hideDescription
     />
   )
@@ -497,6 +668,7 @@ Story.args = {
   coverage: 0.4,
   qualityPreset: 'high',
   resolutionScale: 1,
+  taaEnabled: true,
   temporalUpscale: false,
   temporalUpscaleScale: 0.375,
   animateClouds: true,
@@ -564,6 +736,13 @@ Story.argTypes = {
       min: 0.25,
       max: 1,
       step: 0.05
+    },
+    table: { category: 'rendering' }
+  },
+  taaEnabled: {
+    name: 'taa enabled',
+    control: {
+      type: 'boolean'
     },
     table: { category: 'rendering' }
   },

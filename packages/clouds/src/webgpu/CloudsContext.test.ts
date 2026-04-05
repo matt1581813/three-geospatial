@@ -57,6 +57,7 @@ describe('CloudsContext', () => {
     const context = new CloudsContext()
 
     expect(context.temporalUpscale).toBe(false)
+    expect(context.temporalAntialias).toBe(true)
     expect(context.historyInvalidationRevision).toBe(1)
     expect(context.qualityPreset).toBe('high')
     expect(context.resolutionScale).toBe(
@@ -249,6 +250,14 @@ describe('CloudsContext', () => {
     revision = context.historyInvalidationRevision
 
     context.temporalUpscale = true
+    expect(context.historyInvalidationRevision).toBe(revision)
+
+    context.temporalAntialias = false
+    expect(context.temporalAntialias).toBe(false)
+    expect(context.historyInvalidationRevision).toBe(revision + 1)
+    revision = context.historyInvalidationRevision
+
+    context.temporalAntialias = false
     expect(context.historyInvalidationRevision).toBe(revision)
 
     context.shapeDetail = false

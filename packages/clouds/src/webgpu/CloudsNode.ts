@@ -557,6 +557,7 @@ export class CloudsNode extends TempNode {
       this.cloudsShadowLengthNode = null
     }
     this.temporalUpscaleEnabled = cloudsContext.temporalUpscale
+    const temporalAntialiasEnabled = cloudsContext.temporalAntialias
 
     this.marchMaterial.fragmentNode = this.setupFragmentNode(builder)
     this.marchMaterial.depthNode = this.resolvedDepthNode
@@ -580,6 +581,11 @@ export class CloudsNode extends TempNode {
         this.inputNode.uvNode
       this.resolvedRenderTargets.getTextureNode('depth').uvNode =
         this.inputNode.uvNode
+
+      if (!temporalAntialiasEnabled) {
+        this.temporalResolveNode = undefined
+        return this.resolvedRenderTargets.getTextureNode('output')
+      }
 
       this.temporalResolveNode = createCloudsTemporalResolveNode(
         temporalAntialias,
@@ -606,6 +612,11 @@ export class CloudsNode extends TempNode {
     fullResOutputNode.uvNode = this.inputNode.uvNode
     fullResDepthNode.uvNode = this.inputNode.uvNode
     fullResVelocityNode.uvNode = this.inputNode.uvNode
+
+    if (!temporalAntialiasEnabled) {
+      this.temporalResolveNode = undefined
+      return fullResOutputNode
+    }
 
     this.temporalResolveNode = createCloudsTemporalResolveNode(
       temporalAntialias,

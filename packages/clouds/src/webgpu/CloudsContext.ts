@@ -156,6 +156,7 @@ export class CloudsContext {
   }
 
   private _temporalUpscale = false
+  private _temporalAntialias = true
   private _qualityPreset: QualityPreset = 'high'
   private _resolutionScale = webgpuQualityPresets.high.resolutionScale
   private _temporalUpscaleScale = 0.375
@@ -392,6 +393,18 @@ export class CloudsContext {
       return
     }
     this._temporalUpscale = value
+    this.invalidateHistory()
+  }
+
+  get temporalAntialias(): boolean {
+    return this._temporalAntialias
+  }
+
+  set temporalAntialias(value: boolean) {
+    if (this._temporalAntialias === value) {
+      return
+    }
+    this._temporalAntialias = value
     this.invalidateHistory()
   }
 

@@ -1,5 +1,5 @@
 import { OrbitControls } from '@react-three/drei'
-import { useThree } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import {
   useEffect,
   useLayoutEffect,
@@ -97,6 +97,15 @@ import { useGuardedFrame } from '../hooks/useGuardedFrame'
 import type { PointOfViewProps } from '../hooks/usePointOfView'
 import { useResource } from '../hooks/useResource'
 import { useTransientControl } from '../hooks/useTransientControl'
+import {
+  applyCameraMatrixToCamera,
+  serializeCameraComponents,
+  serializeCameraMatrixElements
+} from '../helpers/cameraMatrixURL'
+import {
+  applyPointOfViewToCamera,
+  readPointOfViewFromCamera
+} from '../helpers/cameraPointOfView'
 import {
   applyFujiNoTilesCloudPreset,
   FUJI_PARITY_ANCHOR_LATITUDE,
@@ -232,6 +241,10 @@ interface StoryProps extends PointOfViewProps {
   enableOrbitControls?: boolean
   orbitControlsTarget?: [number, number, number]
   hideDescription?: boolean
+  cameraMatrixElements?: number[] | null
+  cameraComponents?: number[] | null
+  onCameraMatrixChange?: (elements: number[]) => void
+  onCameraComponentsChange?: (components: number[]) => void
 }
 
 interface StoryArgs extends OutputPassArgs, ToneMappingArgs, LocalDateArgs {
@@ -240,6 +253,7 @@ interface StoryArgs extends OutputPassArgs, ToneMappingArgs, LocalDateArgs {
   coverage: number
   qualityPreset: CloudsQualityPreset
   resolutionScale: number
+  taaEnabled: boolean
   temporalUpscale: boolean
   temporalUpscaleScale: number
   animateClouds: boolean
@@ -263,13 +277,21 @@ const Content: FC<StoryProps> = ({
   disableFallbackNoApiKeyCameraOverride = false,
   disableFallbackEllipsoid = false,
   useIdentityWorldToECEFFrame = false,
-  disableTiles = false
+  disableTiles = false,
+  cameraMatrixElements = null,
+  cameraComponents = null,
+  onCameraMatrixChange,
+  onCameraComponentsChange
 }) => {
   const renderer = useThree<Renderer>(({ gl }) => gl as any)
   const scene = useThree(({ scene }) => scene)
   const camera = useThree(({ camera }) => camera)
   const overlayScene = useMemo(() => new Scene(), [])
   const ellipsoidRef = useRef<Mesh>(null)
+  const appliedCameraMatrixSignatureRef = useRef<string>('')
+  const emittedCameraMatrixSignatureRef = useRef<string>('')
+  const appliedCameraComponentsSignatureRef = useRef<string>('')
+  const emittedCameraComponentsSignatureRef = useRef<string>('')
 
   const atmosphereContext = useResource(() => new AtmosphereContext(), [])
   atmosphereContext.camera = camera
@@ -346,6 +368,7 @@ const Content: FC<StoryProps> = ({
   const resolutionScale = useControl(
     ({ resolutionScale }: StoryArgs) => resolutionScale
   )
+  const taaEnabled = useControl(({ taaEnabled }: StoryArgs) => taaEnabled)
   const temporalUpscaleScale = useControl(
     ({ temporalUpscaleScale }: StoryArgs) => temporalUpscaleScale
   )
@@ -423,6 +446,13 @@ const Content: FC<StoryProps> = ({
       : coverage
     cloudsContext.coverage = baseCoverage
     cloudsContext.resolutionScale = resolutionScale
+    cloudsContext.temporalAntialias = taaEnabled
+    // Keep stochastic blue-noise animation aligned with temporal accumulation.
+    // When TAA is off, freeze STBN to avoid frame-to-frame shimmer diagnostics.
+    cloudsContext.animateStbn = taaEnabled
+    if (!taaEnabled) {
+      cloudsContext.stbnFrameIndex = 0
+    }
     cloudsContext.temporalUpscaleScale = temporalUpscaleScale
     applyCloudMotion(cloudsContext, animateClouds, cloudMotionScale)
     cloudsContext.shapeDetail = shapeDetail
@@ -442,6 +472,7 @@ const Content: FC<StoryProps> = ({
     qualityPreset,
     resolutionScale,
     shapeDetail,
+    taaEnabled,
     temporalUpscaleScale,
     turbulence
   ])
@@ -476,7 +507,7 @@ const Content: FC<StoryProps> = ({
       cloudsContext.temporalUpscale = temporalUpscale
       return clouds(aerialNode, depthNode, camera)
     },
-    [aerialNode, camera, cloudsContext, depthNode, temporalUpscale]
+    [aerialNode, camera, cloudsContext, depthNode, taaEnabled, temporalUpscale]
   )
   const lensFlareNode = useResource(
     () => lensFlare(cloudNode),
@@ -645,6 +676,69 @@ const Content: FC<StoryProps> = ({
     camera
   ])
 
+  useLayoutEffect(() => {
+    if (cameraComponents == null || cameraComponents.length !== 6) {
+      return
+    }
+    const signature = serializeCameraComponents(cameraComponents)
+    if (signature === appliedCameraComponentsSignatureRef.current) {
+      return
+    }
+    if (
+      !applyPointOfViewToCamera(
+        camera,
+        cameraComponents,
+        atmosphereContext.matrixWorldToECEF.value
+      )
+    ) {
+      return
+    }
+    appliedCameraComponentsSignatureRef.current = signature
+    emittedCameraComponentsSignatureRef.current = signature
+  }, [atmosphereContext, camera, cameraComponents])
+
+  useLayoutEffect(() => {
+    if (cameraComponents != null && cameraComponents.length === 6) {
+      return
+    }
+    if (cameraMatrixElements == null || cameraMatrixElements.length !== 16) {
+      return
+    }
+    const signature = serializeCameraMatrixElements(cameraMatrixElements)
+    if (signature === appliedCameraMatrixSignatureRef.current) {
+      return
+    }
+    applyCameraMatrixToCamera(camera, cameraMatrixElements)
+    appliedCameraMatrixSignatureRef.current = signature
+    emittedCameraMatrixSignatureRef.current = signature
+  }, [camera, cameraMatrixElements])
+
+  useFrame(() => {
+    if (onCameraComponentsChange != null) {
+      const components = readPointOfViewFromCamera(
+        camera,
+        atmosphereContext.matrixWorldToECEF.value
+      )
+      if (components != null) {
+        const signature = serializeCameraComponents(components)
+        if (signature !== emittedCameraComponentsSignatureRef.current) {
+          emittedCameraComponentsSignatureRef.current = signature
+          appliedCameraComponentsSignatureRef.current = signature
+          onCameraComponentsChange(components.slice(0, 6))
+        }
+      }
+    }
+    if (onCameraMatrixChange != null) {
+      const elements = camera.matrixWorld.elements.slice(0, 16)
+      const signature = serializeCameraMatrixElements(elements)
+      if (signature !== emittedCameraMatrixSignatureRef.current) {
+        emittedCameraMatrixSignatureRef.current = signature
+        appliedCameraMatrixSignatureRef.current = signature
+        onCameraMatrixChange(elements)
+      }
+    }
+  }, 2)
+
   useLocalDateControls(longitude, date => {
     const { matrixECIToECEF, sunDirectionECEF, moonDirectionECEF } =
       atmosphereContext
@@ -730,6 +824,7 @@ Story.args = {
   coverage: 0.3,
   qualityPreset: 'high',
   resolutionScale: 1,
+  taaEnabled: true,
   temporalUpscale: false,
   temporalUpscaleScale: 0.375,
   animateClouds: false,
@@ -779,6 +874,13 @@ Story.argTypes = {
       min: 0.25,
       max: 1,
       step: 0.05
+    },
+    table: { category: 'rendering' }
+  },
+  taaEnabled: {
+    name: 'taa enabled',
+    control: {
+      type: 'boolean'
     },
     table: { category: 'rendering' }
   },

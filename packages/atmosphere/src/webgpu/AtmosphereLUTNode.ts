@@ -111,6 +111,7 @@ export class AtmosphereLUTNode extends Node {
   private currentVersion?: number
   private currentSetupHash?: number
   private updating = false
+  private abortUpdating = false
   private disposeQueue: (() => void) | undefined
 
   constructor(
@@ -146,19 +147,35 @@ export class AtmosphereLUTNode extends Node {
     const { textures } = this
     invariant(textures != null)
 
-    yield run(renderer, () => {
+    const runStep = (task: () => void): boolean => {
+      if (this.abortUpdating) {
+        return false
+      }
+      return run(renderer, task)
+    }
+
+    yield runStep(() => {
       textures.computeTransmittance(renderer, context)
       this.dispatchUpdate()
     })
-    yield run(renderer, () => {
+    if (this.abortUpdating) {
+      return false
+    }
+    yield runStep(() => {
       textures.computeMultipleScattering(renderer, context)
       this.dispatchUpdate()
     })
-    yield run(renderer, () => {
+    if (this.abortUpdating) {
+      return false
+    }
+    yield runStep(() => {
       textures.computeScattering(renderer, context)
       this.dispatchUpdate()
     })
-    yield run(renderer, () => {
+    if (this.abortUpdating) {
+      return false
+    }
+    yield runStep(() => {
       textures.computeIrradiance(renderer, context)
       this.dispatchUpdate()
     })
@@ -169,10 +186,12 @@ export class AtmosphereLUTNode extends Node {
 
     const context = this.textures.createContext()
     this.updating = true
+    this.abortUpdating = false
     try {
       await timeSlice(this.performCompute(renderer, context))
     } finally {
       this.updating = false
+      this.abortUpdating = false
       context.dispose()
       this.disposeQueue?.()
     }
@@ -232,6 +251,7 @@ export class AtmosphereLUTNode extends Node {
 
   override dispose(): void {
     if (this.updating) {
+      this.abortUpdating = true
       this.disposeQueue = () => {
         this.dispose()
         this.disposeQueue = undefined
