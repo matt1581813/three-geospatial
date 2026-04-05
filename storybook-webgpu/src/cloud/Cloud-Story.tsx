@@ -27,11 +27,15 @@ import {
 import {
   context,
   mix,
+  mrt,
+  normalView,
+  output,
   pass,
   toneMapping,
   uniform,
   uv,
-  vec3
+  vec3,
+  vec4
 } from 'three/tsl'
 import {
   MeshBasicNodeMaterial,
@@ -65,7 +69,11 @@ import {
   STBNLoader
 } from '@takram/three-geospatial'
 import { EllipsoidMesh } from '@takram/three-geospatial/r3f'
-import { dithering, lensFlare } from '@takram/three-geospatial/webgpu'
+import {
+  dithering,
+  highpVelocity,
+  lensFlare
+} from '@takram/three-geospatial/webgpu'
 
 import { applyCloudStoryPreset } from '../clouds/storyPresets'
 import type { StoryFC } from '../components/createStory'
@@ -120,6 +128,7 @@ import stbnUrl from '../../../packages/core/assets/stbn.bin?url'
 const LOCAL_WEATHER_VELOCITY = [0.001, 0] as const
 const SHAPE_VELOCITY = [0.00012, 0, 0] as const
 const SHAPE_DETAIL_VELOCITY = [0.0015, 0, 0] as const
+const WEBGL_AERIAL_ALBEDO_SCALE = 2 / Math.PI
 const WORLD_UP = new Vector3(0, 1, 0)
 const targetScratch = new Vector3()
 const eyeScratch = new Vector3()
@@ -245,6 +254,7 @@ interface StoryProps extends PointOfViewProps {
   cameraComponents?: number[] | null
   onCameraMatrixChange?: (elements: number[]) => void
   onCameraComponentsChange?: (components: number[]) => void
+  alignWithWebGLLightingModel?: boolean
 }
 
 interface StoryArgs extends OutputPassArgs, ToneMappingArgs, LocalDateArgs {
@@ -278,6 +288,7 @@ const Content: FC<StoryProps> = ({
   disableFallbackEllipsoid = false,
   useIdentityWorldToECEFFrame = false,
   disableTiles = false,
+  alignWithWebGLLightingModel = false,
   cameraMatrixElements = null,
   cameraComponents = null,
   onCameraMatrixChange,
@@ -434,12 +445,14 @@ const Content: FC<StoryProps> = ({
       applyCloudStoryPreset(cloudsContext, 'ground')
     }
     if (forceWebglLikeMarchBudget) {
-      cloudsContext.clouds.maxIterationCount = 192
+      cloudsContext.clouds.maxIterationCount = 256
       cloudsContext.clouds.minStepSize = 50
       cloudsContext.clouds.maxStepSize = 1000
       cloudsContext.clouds.perspectiveStepScale = 1.01
-      cloudsContext.clouds.minDensity = 1e-4
-      cloudsContext.clouds.minExtinction = 1e-4
+      cloudsContext.clouds.minDensity = 1e-5
+      cloudsContext.clouds.minExtinction = 1e-5
+      cloudsContext.clouds.maxIterationCountToGround = 3
+      cloudsContext.clouds.maxIterationCountToSun = 2
     }
     const baseCoverage = alignWithWebGLBasic
       ? Math.min(coverage * (5 / 3), 1)
@@ -478,28 +491,52 @@ const Content: FC<StoryProps> = ({
   ])
 
   const fallbackGlobeMaterial = useResource(
-    () =>
-      new MeshBasicNodeMaterial({
+    () => {
+      if (alignWithWebGLLightingModel) {
+        return new MeshBasicNodeMaterial({
+          color: '#6b695e'
+        })
+      }
+      return new MeshBasicNodeMaterial({
         colorNode: mix(
           vec3(0.18, 0.19, 0.16),
           vec3(0.42, 0.4, 0.34),
           uv().y.pow(1.55)
         )
-      }),
-    []
+      })
+    },
+    [alignWithWebGLLightingModel]
   )
 
   const passNode = useResource(
-    () => pass(scene, camera, { samples: 4 }),
+    () =>
+      pass(scene, camera, { samples: 4 }).setMRT(
+        mrt({
+          output,
+          normal: normalView,
+          velocity: highpVelocity
+        })
+      ),
     [scene, camera]
   )
 
   const colorNode = passNode.getTextureNode('output')
   const depthNode = passNode.getTextureNode('depth')
+  const normalNode = passNode.getTextureNode('normal')
+
+  const enableWebGLLightingModel = alignWithWebGLLightingModel && apiKey != null
+
+  const aerialInputNode = useResource(
+    () =>
+      enableWebGLLightingModel
+        ? vec4(colorNode.rgb.mul(WEBGL_AERIAL_ALBEDO_SCALE), colorNode.a)
+        : colorNode,
+    [enableWebGLLightingModel, colorNode]
+  )
 
   const aerialNode = useResource(
-    () => aerialPerspective(colorNode, depthNode),
-    [colorNode, depthNode]
+    () => aerialPerspective(aerialInputNode, depthNode, normalNode),
+    [aerialInputNode, depthNode, normalNode]
   )
 
   const cloudNode = useResource(
@@ -539,6 +576,12 @@ const Content: FC<StoryProps> = ({
       ),
     [renderer, toneMappingNode, overlayPassNode]
   )
+
+  useLayoutEffect(() => {
+    aerialNode.lighting = enableWebGLLightingModel
+    aerialNode.correctGeometricError = true
+    postProcessing.needsUpdate = true
+  }, [aerialNode, enableWebGLLightingModel, postProcessing])
 
   useGuardedFrame(() => {
     postProcessing.render()

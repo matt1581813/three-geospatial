@@ -24,6 +24,7 @@ import {
   mix,
   min,
   mrt,
+  remapClamp,
   screenCoordinate,
   select,
   sqrt,
@@ -507,10 +508,13 @@ export class CloudsShadowLengthNode extends TempNode {
           const cameraWorld = matrixWorld
             .mul(vec4(vec3(0), 1))
             .xyz.toConst()
+          const sceneDepthBlend = float(1)
+            .sub(remapClamp(depth, float(0.999), float(1)))
+            .toConst()
           const rayDirectionWorld = mix(
             farDirectionWorld,
             scenePositionWorld.sub(cameraWorld).normalize(),
-            depth.lessThan(float(1)).toFloat()
+            sceneDepthBlend
           )
             .normalize()
             .toConst()
@@ -527,15 +531,15 @@ export class CloudsShadowLengthNode extends TempNode {
             .xyz.mul(atmosphere.worldToUnit)
             .add(altitudeCorrectionUnit)
             .toConst()
-          const sceneDistance = mix(
-            clouds.maxShadowLengthRayDistanceNode.mul(atmosphere.worldToUnit),
-            cameraPositionUnit.distance(scenePositionUnit),
-            depth.lessThan(float(1)).toFloat()
-          ).toConst()
           const rayDirectionUnit = atmosphere.matrixWorldToECEF
             .mul(vec4(rayDirectionWorld, 0))
             .xyz.normalize()
             .toConst()
+          const sceneDistance = mix(
+            clouds.maxShadowLengthRayDistanceNode.mul(atmosphere.worldToUnit),
+            max(scenePositionUnit.sub(cameraPositionUnit).dot(rayDirectionUnit), 0),
+            sceneDepthBlend
+          ).toConst()
           const shadowTopRadius = atmosphere.bottomRadius
             .add(clouds.shadowMaxHeightNode.mul(atmosphere.worldToUnit))
             .toConst()

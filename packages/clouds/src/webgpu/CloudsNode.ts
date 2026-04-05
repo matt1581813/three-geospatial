@@ -102,6 +102,7 @@ const EPSILON = 1e-6
 const WEBGPU_MAX_SHADOW_LENGTH_STEPS = 512
 const HIGH_FREQUENCY_FADE_START = 20_000
 const HIGH_FREQUENCY_FADE_END = 120_000
+const SHAPE_DETAIL_FADE_FLOOR = 0.02
 const RECIPROCAL_PI4 = 1 / (4 * Math.PI)
 export const CLOUDS_TEMPORAL_ALPHA = 0.05
 export const CLOUDS_VARIANCE_GAMMA = 1.0
@@ -989,18 +990,24 @@ export class CloudsNode extends TempNode {
               float(0.04),
               float(0.18)
             ).toConst()
-            const detailFade = highFrequencyWeight
+            const detailFade = remapClamp(
+              highFrequencyWeight
               .mul(densityEdgeFade.pow2())
-              .mul(float(1).sub(remapClamp(mipLevel, float(0.1), float(0.85))))
+              .mul(float(1).sub(remapClamp(mipLevel, float(0.1), float(0.85)))),
+              float(SHAPE_DETAIL_FADE_FLOOR),
+              float(1)
+            )
               .toConst()
             const shapeDetailPosition = positionWorld
               .add(turbulence)
               .mul(clouds.shapeDetailRepeatNode)
               .add(clouds.shapeDetailOffsetNode)
               .toConst()
-            const detail = this.shapeDetailTextureNode
-              .sample(shapeDetailPosition)
-              .r.toConst()
+            const detail = textureLevel(
+              this.shapeDetailTextureNode,
+              shapeDetailPosition,
+              mipLevel
+            ).r.toConst()
               If(
                 clouds.shapeDetailNode.and(detailFade.greaterThan(EPSILON)),
                 () => {
@@ -1405,6 +1412,9 @@ export class CloudsNode extends TempNode {
         .xyz.normalize()
         .toConst()
 
+      const sceneDepthBlend = float(1)
+        .sub(remapClamp(depth, float(0.999), float(1)))
+        .toConst()
       const sceneViewZ = depthToViewZ(depth, near, far, {
         perspective,
         logarithmic
@@ -1422,7 +1432,7 @@ export class CloudsNode extends TempNode {
       const rayDirectionWorld = mix(
         farDirectionWorld,
         scenePositionWorld.sub(cameraWorld).normalize(),
-        depth.lessThan(1).toFloat()
+        sceneDepthBlend
       ).normalize()
 
       const rayDirectionUnit = atmosphere.matrixWorldToECEF
@@ -1545,11 +1555,14 @@ export class CloudsNode extends TempNode {
         .add(altitudeCorrectionUnit)
         .toConst()
 
+      // Match legacy semantics: clamp against scene hit distance along the
+      // current view ray, not the Euclidean point-to-point distance. Blend the
+      // clamp near depth==1 to avoid horizon discontinuities.
       const sceneDistance = mix(
         clouds.maxRayDistanceNode.mul(atmosphere.worldToUnit),
-        cameraPositionUnit.distance(scenePositionUnit),
-        depth.lessThan(1).toFloat()
-      ).toVar()
+        max(scenePositionUnit.sub(cameraPositionUnit).dot(rayDirectionUnit), 0),
+        sceneDepthBlend
+      ).toConst()
       const sceneDistanceWorld = sceneDistance.mul(unitToWorld).toConst()
       const globalShadowLengthWorld = (this.cloudsShadowLengthNode ?? float(0))
         .mul(unitToWorld)
@@ -1650,9 +1663,7 @@ export class CloudsNode extends TempNode {
               )
             )
           })
-          shadowNearFarWorld.y.assign(
-            min(shadowNearFarWorld.y, sceneDistanceWorld)
-          )
+          shadowNearFarWorld.y.assign(min(shadowNearFarWorld.y, sceneDistanceWorld))
         }
       )
 
@@ -1886,12 +1897,13 @@ export class CloudsNode extends TempNode {
               ),
               () => {
                 turbulence.assign(
-                  this.turbulenceTextureNode
-                    .sample(
-                      weatherUv
-                        .mul(clouds.localWeatherRepeatNode)
-                        .mul(clouds.turbulenceRepeatNode)
-                    )
+                  textureLevel(
+                    this.turbulenceTextureNode,
+                    weatherUv
+                      .mul(clouds.localWeatherRepeatNode)
+                      .mul(clouds.turbulenceRepeatNode),
+                    mipLevel
+                  )
                     .rgb.mul(2)
                     .sub(1)
                     .mul(
@@ -1901,14 +1913,15 @@ export class CloudsNode extends TempNode {
               }
             )
 
-            const shape = this.shapeTextureNode
-              .sample(
-                positionWorld
-                  .add(evolution)
-                  .add(turbulence)
-                  .mul(clouds.shapeRepeatNode)
-                  .add(clouds.shapeOffsetNode)
-              )
+            const shape = textureLevel(
+              this.shapeTextureNode,
+              positionWorld
+                .add(evolution)
+                .add(turbulence)
+                .mul(clouds.shapeRepeatNode)
+                .add(clouds.shapeOffsetNode),
+              mipLevel
+            )
               .r.toConst()
             let density = remapClamp(
               weatherDensity,
@@ -1926,18 +1939,24 @@ export class CloudsNode extends TempNode {
               float(0.04),
               float(0.18)
             ).toConst()
-            const detailFade = highFrequencyWeight
+            const detailFade = remapClamp(
+              highFrequencyWeight
               .mul(densityEdgeFade.pow2())
-              .mul(float(1).sub(remapClamp(mipLevel, float(0.1), float(0.85))))
+              .mul(float(1).sub(remapClamp(mipLevel, float(0.1), float(0.85)))),
+              float(SHAPE_DETAIL_FADE_FLOOR),
+              float(1)
+            )
               .toConst()
             const shapeDetailPosition = positionWorld
               .add(turbulence)
               .mul(clouds.shapeDetailRepeatNode)
               .add(clouds.shapeDetailOffsetNode)
               .toConst()
-            const detail = this.shapeDetailTextureNode
-              .sample(shapeDetailPosition)
-              .r.toConst()
+            const detail = textureLevel(
+              this.shapeDetailTextureNode,
+              shapeDetailPosition,
+              mipLevel
+            ).r.toConst()
               If(
                 clouds.shapeDetailNode.and(detailFade.greaterThan(EPSILON)),
                 () => {

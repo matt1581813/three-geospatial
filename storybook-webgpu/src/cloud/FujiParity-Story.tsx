@@ -646,8 +646,8 @@ export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
       useFujiNoTilesCloudPreset={cloudPresetMode === 'fuji-no-tiles'}
       forceWebglLikeMarchBudget={cloudPresetMode === 'legacy-default'}
       disableFallbackNoApiKeyCameraOverride
-      disableFallbackEllipsoid
       useIdentityWorldToECEFFrame={false}
+      alignWithWebGLLightingModel
       updateArgs={() => undefined}
       enableOrbitControls
       orbitControlsTarget={orbitTarget}
