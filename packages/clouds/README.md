@@ -34,8 +34,21 @@ Implementation status, M1 acceptance notes, and M2 planning are tracked in
 [`docs/webgpu-clouds-status.md`](./docs/webgpu-clouds-status.md).
 
 ```ts
-import { CloudsContext, clouds } from '@takram/three-clouds/webgpu'
+import { clouds, CloudsContext } from '@takram/three-clouds/webgpu'
 ```
+
+React Three Fiber context helpers are available at
+`@takram/three-clouds/webgpu/r3f`:
+
+```tsx
+import { Clouds as WebGPUClouds } from '@takram/three-clouds/webgpu/r3f'
+```
+
+`WebGPUClouds` provides a `CloudsContext` to the WebGPU node builder through
+`renderer.contextNode.getClouds()`, loads the standard weather / shape / detail
+/ turbulence / STBN textures, and exposes `CloudLayer` children for layer
+configuration. It does not render by itself; compose `clouds(...)` inside a
+Three WebGPU `RenderPipeline`.
 
 The current WebGPU path is intentionally low-level and is designed to be used
 with `renderer.contextNode` together with `@takram/three-atmosphere/webgpu`.
@@ -64,7 +77,6 @@ Current limitations of the WebGPU path:
 
 - `AtmosphereContext` is required. Standalone fallback is not supported.
 - `ProceduralTexture` and `Procedural3DTexture` are still WebGL-only.
-- `/webgpu/r3f` helpers are not included yet.
 - WebGPU clouds are composed as nodes and do not integrate with `postprocessing`'s `EffectComposer` bridge.
 
 ## Usage

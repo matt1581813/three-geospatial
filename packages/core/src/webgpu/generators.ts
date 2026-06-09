@@ -24,6 +24,13 @@ export const dithering: Node<'vec3'> = /*#__PURE__*/ Fn(() => {
   return vec3(noise, noise.oneMinus(), noise).sub(0.5).div(255)
 }).once()()
 
+// Uses the same ordered noise amplitude as dithering, but keeps the pattern
+// frame-stable for deterministic captures and high-altitude cloud parity views.
+export const stationaryDithering: Node<'vec3'> = /*#__PURE__*/ Fn(() => {
+  const noise = interleavedGradientNoise(vec2(screenCoordinate.xy))
+  return vec3(noise, noise.oneMinus(), noise).sub(0.5).div(255)
+}).once()()
+
 export const equirectGrid = (
   direction: Node<'vec3'>,
   lineWidth: Node<'float'>,

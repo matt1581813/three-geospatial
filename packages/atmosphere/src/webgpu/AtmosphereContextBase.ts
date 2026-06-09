@@ -130,6 +130,14 @@ export class AtmosphereContextBase {
   readonly parameters: AtmosphereParameters
   readonly parametersNode: Node & AtmosphereParametersFields
 
+  get worldToUnit() {
+    return this.parametersNode.worldToUnit
+  }
+
+  get bottomRadius() {
+    return this.parametersNode.bottomRadius
+  }
+
   constructor(parameters: AtmosphereParameters) {
     this.parameters = parameters
 

@@ -47,7 +47,8 @@ export default defineConfig({
       entry: {
         'build/index': 'src/index.ts',
         'build/r3f': 'src/r3f/index.ts',
-        'build/webgpu': 'src/webgpu/index.ts'
+        'build/webgpu': 'src/webgpu/index.ts',
+        'build/webgpu/r3f': 'src/webgpu/r3f/index.ts'
       },
       name: 'clouds'
     },

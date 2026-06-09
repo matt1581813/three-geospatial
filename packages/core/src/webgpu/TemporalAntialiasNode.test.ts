@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, test, vi } from 'vitest'
 type TemporalAntialiasNodeModule = typeof import('./TemporalAntialiasNode')
 
 let biasTemporalAlphaWithCurrentFrameWeight: TemporalAntialiasNodeModule['biasTemporalAlphaWithCurrentFrameWeight']
+let biasTemporalAlphaWithHistoryConfidence: TemporalAntialiasNodeModule['biasTemporalAlphaWithHistoryConfidence']
 
 beforeAll(async () => {
   vi.stubGlobal('GPUShaderStage', {
@@ -40,10 +41,10 @@ beforeAll(async () => {
     ALPHA: 8,
     ALL: 15
   })
-
-  ;({ biasTemporalAlphaWithCurrentFrameWeight } = await import(
-    './TemporalAntialiasNode'
-  ))
+  ;({
+    biasTemporalAlphaWithCurrentFrameWeight,
+    biasTemporalAlphaWithHistoryConfidence
+  } = await import('./TemporalAntialiasNode'))
 })
 
 describe('TemporalAntialiasNode current-frame mask weighting', () => {
@@ -53,5 +54,15 @@ describe('TemporalAntialiasNode current-frame mask weighting', () => {
 
   test('promotes the final temporal alpha to one when the current frame mask is one', () => {
     expect(biasTemporalAlphaWithCurrentFrameWeight(0.12, 1)).toBeCloseTo(1)
+  })
+})
+
+describe('TemporalAntialiasNode history confidence weighting', () => {
+  test('promotes temporal alpha to one when history confidence is zero', () => {
+    expect(biasTemporalAlphaWithHistoryConfidence(0.14, 0)).toBeCloseTo(1)
+  })
+
+  test('keeps the base temporal alpha when history confidence is one', () => {
+    expect(biasTemporalAlphaWithHistoryConfidence(0.14, 1)).toBeCloseTo(0.14)
   })
 })

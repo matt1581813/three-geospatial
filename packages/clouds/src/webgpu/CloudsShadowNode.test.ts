@@ -10,7 +10,9 @@ let getCloudShadowCascadeDepth: CloudsShadowModule['getCloudShadowCascadeDepth']
 let getCloudShadowCascadeFadeWidth: CloudsShadowModule['getCloudShadowCascadeFadeWidth']
 let getCloudShadowCascadeBlendWeights: CloudsShadowModule['getCloudShadowCascadeBlendWeights']
 let resolveCloudShadowCascadeIndex: CloudsShadowModule['resolveCloudShadowCascadeIndex']
+let resolveCloudShadowFadedCascadeIndex: CloudsShadowModule['resolveCloudShadowFadedCascadeIndex']
 let computeCloudShadowOpticalDepth: CloudsShadowModule['computeCloudShadowOpticalDepth']
+let computeCloudShadowSurfaceOpticalDepth: CloudsShadowModule['computeCloudShadowSurfaceOpticalDepth']
 let computeCloudShadowOpticalDepthTail: CloudsShadowModule['computeCloudShadowOpticalDepthTail']
 let computeCloudShadowFilterRadius: CloudsShadowModule['computeCloudShadowFilterRadius']
 let WEBGPU_CLOUD_BODY_MAX_FILTER_RADIUS: CloudsShadowModule['WEBGPU_CLOUD_BODY_MAX_FILTER_RADIUS']
@@ -62,7 +64,9 @@ beforeAll(async () => {
     getCloudShadowCascadeFadeWidth,
     getCloudShadowCascadeBlendWeights,
     resolveCloudShadowCascadeIndex,
+    resolveCloudShadowFadedCascadeIndex,
     computeCloudShadowOpticalDepth,
+    computeCloudShadowSurfaceOpticalDepth,
     computeCloudShadowOpticalDepthTail,
     computeCloudShadowFilterRadius,
     WEBGPU_CLOUD_BODY_MAX_FILTER_RADIUS
@@ -118,6 +122,41 @@ describe('CloudsShadowNode helpers', () => {
     expect(resolveCloudShadowCascadeIndex(0.6, intervals, 3)).toBe(2)
   })
 
+  test('matches WebGL stochastic cascade fade selection for Beer shadow samples', () => {
+    const intervals = [
+      new Vector2(0, 0.13339799558860332),
+      new Vector2(0.13339799558860332, 0.2728812798267225),
+      new Vector2(0.2728812798267225, 1)
+    ]
+    const boundary = intervals[0].y
+    const fadeWidth = boundary * boundary * 0.5
+    const expandedStart = boundary - fadeWidth * 0.5
+    const quarterFadeDepth = expandedStart + fadeWidth * 0.25
+
+    expect(
+      resolveCloudShadowFadedCascadeIndex(0.05, intervals, 3, 0.75)
+    ).toBe(0)
+    expect(
+      resolveCloudShadowFadedCascadeIndex(
+        quarterFadeDepth,
+        intervals,
+        3,
+        0.2
+      )
+    ).toBe(1)
+    expect(
+      resolveCloudShadowFadedCascadeIndex(
+        quarterFadeDepth,
+        intervals,
+        3,
+        0.8
+      )
+    ).toBe(0)
+    expect(
+      resolveCloudShadowFadedCascadeIndex(0.6, intervals, 3, 0.75)
+    ).toBe(2)
+  })
+
   test('produces stable normalized blend weights across cascade transitions', () => {
     const intervals = [
       new Vector2(0, 0.13339799558860332),
@@ -152,6 +191,18 @@ describe('CloudsShadowNode helpers', () => {
     ).toBeCloseTo(10.5)
     expect(
       computeCloudShadowOpticalDepth(12_000, 0, 20_000, 0.002, 7, 1)
+    ).toBeCloseTo(0)
+  })
+
+  test('matches WebGL surface shadow reconstruction without optical-depth tail', () => {
+    expect(
+      computeCloudShadowSurfaceOpticalDepth(18_000, 9_000, 0.0015, 11)
+    ).toBeCloseTo(11)
+    expect(
+      computeCloudShadowSurfaceOpticalDepth(18_000, 9_000, 0.0015, 17)
+    ).toBeCloseTo(13.5)
+    expect(
+      computeCloudShadowSurfaceOpticalDepth(12_000, 20_000, 0.002, 7)
     ).toBeCloseTo(0)
   })
 

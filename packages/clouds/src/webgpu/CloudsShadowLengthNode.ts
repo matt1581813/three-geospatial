@@ -21,8 +21,8 @@ import {
   ivec2,
   Loop,
   max,
-  mix,
   min,
+  mix,
   mrt,
   remapClamp,
   screenCoordinate,
@@ -51,11 +51,11 @@ import {
   type AtmosphereContext
 } from '@takram/three-atmosphere/webgpu'
 import {
-  FnLayout,
-  FnVar,
   cameraFar,
   cameraNear,
   depthToViewZ,
+  FnLayout,
+  FnVar,
   inverseProjectionMatrix,
   inverseViewMatrix,
   outputTexture,
@@ -82,6 +82,7 @@ const cameraQuaternionScratch = /*#__PURE__*/ new Quaternion()
 const EPSILON = 1e-6
 const WEBGPU_MAX_SHADOW_LENGTH_STEPS = 512
 const SHADOW_LENGTH_RESOLUTION_SCALE = 0.25
+const HORIZON_GROUND_HIT_EPSILON_WORLD = 100
 const SHADOW_LENGTH_CAMERA_CUT_POSITION_THRESHOLD = 1_000
 const SHADOW_LENGTH_CAMERA_CUT_ROTATION_THRESHOLD = Math.PI / 12
 const SHADOW_LENGTH_CAMERA_CUT_PROJECTION_THRESHOLD = 1e-3
@@ -178,7 +179,10 @@ const varianceClippingFullscreen = /*#__PURE__*/ FnVar(
     const moment2 = current.pow2().toVar()
 
     for (const offset of varianceOffsets) {
-      const neighborCoord = coord.add(offset).clamp(ivec2(0), maxCoord).toConst()
+      const neighborCoord = coord
+        .add(offset)
+        .clamp(ivec2(0), maxCoord)
+        .toConst()
       const neighbor = inputNode.load(neighborCoord).toConst()
       moment1.addAssign(neighbor)
       moment2.addAssign(neighbor.pow2())
@@ -211,7 +215,10 @@ export class CloudsShadowLengthNode extends TempNode {
     })
   private resolveRenderTarget = this.createRenderTarget('Resolve')
   private historyRenderTarget = this.createRenderTarget('History')
-  private readonly textureNode = outputTexture(this, this.resolveRenderTarget.texture)
+  private readonly textureNode = outputTexture(
+    this,
+    this.resolveRenderTarget.texture
+  )
   private readonly currentMaterial = new NodeMaterial()
   private readonly resolveMaterial = new NodeMaterial()
   private readonly currentMesh = new QuadMesh(this.currentMaterial)
@@ -249,8 +256,10 @@ export class CloudsShadowLengthNode extends TempNode {
     this.depthNode = depthNode
     this.camera = camera
     this.shadowNode = shadowNode
-    this.currentRenderTargets.getTexture('depthVelocity').minFilter = NearestFilter
-    this.currentRenderTargets.getTexture('depthVelocity').magFilter = NearestFilter
+    this.currentRenderTargets.getTexture('depthVelocity').minFilter =
+      NearestFilter
+    this.currentRenderTargets.getTexture('depthVelocity').magFilter =
+      NearestFilter
     this.currentMaterial.name = 'CloudsShadowLengthNode.Current'
     this.resolveMaterial.name = 'CloudsShadowLengthNode.Resolve'
     this.updateBeforeType = NodeUpdateType.FRAME
@@ -272,7 +281,10 @@ export class CloudsShadowLengthNode extends TempNode {
     return renderTarget
   }
 
-  setContexts(cloudsContext: CloudsContext, atmosphereContext: AtmosphereContext): void {
+  setContexts(
+    cloudsContext: CloudsContext,
+    atmosphereContext: AtmosphereContext
+  ): void {
     this.cloudsContext = cloudsContext
     this.atmosphereContext = atmosphereContext
     this.shadowNode.setContexts(cloudsContext, atmosphereContext)
@@ -287,7 +299,7 @@ export class CloudsShadowLengthNode extends TempNode {
   }
 
   sampleShadowLength(uvNode: Node<'vec2'> = uv()): Node<'float'> {
-    return this.textureNode.sample(uvNode).r
+    return this.textureNode.sample(uvNode).r.max(0)
   }
 
   private setSize(width: number, height: number): boolean {
@@ -319,7 +331,9 @@ export class CloudsShadowLengthNode extends TempNode {
     cameraPositionScratch.setFromMatrixPosition(this.camera.matrixWorld)
     cameraQuaternionScratch.setFromRotationMatrix(this.camera.matrixWorld)
 
-    const positionDelta = cameraPositionScratch.distanceTo(this.previousCameraPosition)
+    const positionDelta = cameraPositionScratch.distanceTo(
+      this.previousCameraPosition
+    )
     const rotationDelta =
       2 *
       Math.acos(
@@ -385,7 +399,9 @@ export class CloudsShadowLengthNode extends TempNode {
     this.resolveHistoryWeightNode.value = useHistory ? 1 : 0
 
     viewReprojectionMatrixScratch.multiplyMatrices(
-      useHistory ? this.previousViewProjectionMatrix : viewProjectionMatrixScratch,
+      useHistory
+        ? this.previousViewProjectionMatrix
+        : viewProjectionMatrixScratch,
       this.camera.matrixWorld
     )
     this.viewReprojectionNode.value.copy(viewReprojectionMatrixScratch)
@@ -443,16 +459,11 @@ export class CloudsShadowLengthNode extends TempNode {
     const camera = this.camera
     const near = cameraNear(camera)
     const far = cameraFar(camera)
-    const logarithmic = builder.renderer.logarithmicDepthBuffer
-    const perspective = camera.isPerspectiveCamera
     const unitToWorld = float(1).div(atmosphere.worldToUnit).toConst()
 
     const fragmentNode = Fn(() => {
       const depth = this.depthNode.sample(uv()).r.toConst()
-      const farViewZ = depthToViewZ(float(1), near, far, {
-        perspective,
-        logarithmic
-      }).toConst()
+      const farViewZ = depthToViewZ(float(1), camera, near, far).toConst()
       const farPositionView = screenToPositionView(
         uv(),
         float(1),
@@ -460,10 +471,7 @@ export class CloudsShadowLengthNode extends TempNode {
         projectionMatrix(camera),
         inverseProjectionMatrix(camera)
       ).toConst()
-      const sceneViewZ = depthToViewZ(depth, near, far, {
-        perspective,
-        logarithmic
-      }).toConst()
+      const sceneViewZ = depthToViewZ(depth, camera, near, far).toConst()
       const scenePositionView = screenToPositionView(
         uv(),
         depth,
@@ -505,9 +513,7 @@ export class CloudsShadowLengthNode extends TempNode {
           const scenePositionWorld = matrixWorld
             .mul(vec4(scenePositionView, 1))
             .xyz.toConst()
-          const cameraWorld = matrixWorld
-            .mul(vec4(vec3(0), 1))
-            .xyz.toConst()
+          const cameraWorld = matrixWorld.mul(vec4(vec3(0), 1)).xyz.toConst()
           const sceneDepthBlend = float(1)
             .sub(remapClamp(depth, float(0.999), float(1)))
             .toConst()
@@ -537,7 +543,10 @@ export class CloudsShadowLengthNode extends TempNode {
             .toConst()
           const sceneDistance = mix(
             clouds.maxShadowLengthRayDistanceNode.mul(atmosphere.worldToUnit),
-            max(scenePositionUnit.sub(cameraPositionUnit).dot(rayDirectionUnit), 0),
+            max(
+              scenePositionUnit.sub(cameraPositionUnit).dot(rayDirectionUnit),
+              0
+            ),
             sceneDepthBlend
           ).toConst()
           const shadowTopRadius = atmosphere.bottomRadius
@@ -557,18 +566,32 @@ export class CloudsShadowLengthNode extends TempNode {
           ).toConst()
           const groundHit = cameraPositionUnit
             .dot(rayDirectionUnit)
-            .lessThan(0)
-            .and(groundIntersections.y.greaterThan(EPSILON))
+            .lessThan(float(-1e-5))
+            .and(
+              groundIntersections.x.greaterThan(
+                float(HORIZON_GROUND_HIT_EPSILON_WORLD).mul(
+                  atmosphere.worldToUnit
+                )
+              )
+            )
+            .and(groundIntersections.x.lessThan(sceneDistance))
             .toConst()
           const segmentStart = float(-1).toVar()
           const segmentEnd = float(-1).toVar()
 
-          If(atmosphere.cameraHeight.lessThan(clouds.shadowMaxHeightNode), () => {
-            segmentStart.assign(float(near).mul(atmosphere.worldToUnit))
-            segmentEnd.assign(
-              select(groundHit, groundIntersections.x, shadowTopIntersections.y)
-            )
-          }).Else(() => {
+          If(
+            atmosphere.cameraHeight.lessThan(clouds.shadowMaxHeightNode),
+            () => {
+              segmentStart.assign(float(near).mul(atmosphere.worldToUnit))
+              segmentEnd.assign(
+                select(
+                  groundHit,
+                  groundIntersections.x,
+                  shadowTopIntersections.y
+                )
+              )
+            }
+          ).Else(() => {
             segmentStart.assign(max(shadowTopIntersections.x, float(0)))
             segmentEnd.assign(
               select(
@@ -614,9 +637,7 @@ export class CloudsShadowLengthNode extends TempNode {
                   .sampleOpticalDepth(samplePositionWorld)
                   .toConst()
                 outputShadowLength.addAssign(
-                  float(1)
-                    .sub(exp(opticalDepth.negate()))
-                    .mul(stepSizeWorld)
+                  float(1).sub(exp(opticalDepth.negate())).mul(stepSizeWorld)
                 )
                 stepSizeWorld.mulAssign(clouds.perspectiveStepScaleNode)
                 rayDistanceWorld.addAssign(stepSizeWorld)
@@ -627,8 +648,13 @@ export class CloudsShadowLengthNode extends TempNode {
       )
 
       return mrt({
-        shadowLength: vec4(outputShadowLength.mul(atmosphere.worldToUnit), 0, 0, 1),
-        depthVelocity: vec4(frontDepth, velocity, 0)
+        shadowLength: vec4(
+          outputShadowLength.mul(atmosphere.worldToUnit),
+          0,
+          0,
+          1
+        ),
+        depthVelocity: vec4(depth, velocity, frontDepth)
       })
     })()
 
@@ -644,7 +670,8 @@ export class CloudsShadowLengthNode extends TempNode {
   private setupResolveFragmentNode(): Node {
     const currentShadowLengthNode =
       this.currentRenderTargets.getTextureNode('shadowLength')
-    const depthVelocityNode = this.currentRenderTargets.getTextureNode('depthVelocity')
+    const depthVelocityNode =
+      this.currentRenderTargets.getTextureNode('depthVelocity')
 
     return Fn(() => {
       const coord = ivec2(screenCoordinate).toConst()
@@ -656,8 +683,13 @@ export class CloudsShadowLengthNode extends TempNode {
         const closestDepth = float(1e9).toVar()
 
         for (const offset of closestNeighborOffsets) {
-          const neighborCoord = coord.add(offset).clamp(ivec2(0), maxCoord).toConst()
-          const neighborDepth = depthVelocityNode.load(neighborCoord).r.toConst()
+          const neighborCoord = coord
+            .add(offset)
+            .clamp(ivec2(0), maxCoord)
+            .toConst()
+          const neighborDepth = depthVelocityNode
+            .load(neighborCoord)
+            .r.toConst()
           If(neighborDepth.lessThan(closestDepth), () => {
             closestCoord.assign(neighborCoord)
             closestDepth.assign(neighborDepth)
@@ -672,8 +704,11 @@ export class CloudsShadowLengthNode extends TempNode {
           .all()
           .and(prevUv.lessThanEqual(vec2(1)).all())
           .toConst()
+        const historyDepthWeight = depthVelocity.r
+          .lessThan(float(0.9995))
+          .toConst()
 
-        If(insideHistory, () => {
+        If(insideHistory.and(historyDepthWeight), () => {
           const historyColor = this.historyNode.sample(prevUv).toConst()
           const clippedHistory = varianceClippingFullscreen(
             currentShadowLengthNode,
@@ -684,11 +719,16 @@ export class CloudsShadowLengthNode extends TempNode {
             float(SHADOW_LENGTH_VARIANCE_GAMMA)
           ).toConst()
           outputColor.assign(
-            mix(clippedHistory, outputColor, float(SHADOW_LENGTH_TEMPORAL_ALPHA))
+            mix(
+              clippedHistory,
+              outputColor,
+              float(SHADOW_LENGTH_TEMPORAL_ALPHA)
+            )
           )
         })
       })
 
+      outputColor.assign(vec4(outputColor.r.max(0), outputColor.gba))
       return outputColor
     })()
   }

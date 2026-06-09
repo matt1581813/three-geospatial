@@ -1,8 +1,10 @@
 import { beforeAll, describe, expect, test, vi } from 'vitest'
 
 type AerialPerspectiveModule = typeof import('./AerialPerspectiveNode')
+type TslModule = typeof import('three/tsl')
 
 let resolveCloudsAerialProviders: AerialPerspectiveModule['resolveCloudsAerialProviders']
+let float: TslModule['float']
 
 beforeAll(async () => {
   vi.stubGlobal('GPUShaderStage', {
@@ -41,6 +43,7 @@ beforeAll(async () => {
     ALL: 15
   })
 
+  ;({ float } = await import('three/tsl'))
   ;({ resolveCloudsAerialProviders } = await import('./AerialPerspectiveNode'))
 })
 
@@ -55,34 +58,72 @@ describe('AerialPerspective cloud providers', () => {
   })
 
   test('resolves cloud-shadow sampler from getCloudsShadow()', () => {
-    const sample = vi.fn(() => 0.7)
+    const positionWorldNode = { id: 'position' } as any
+    const normalWorldNode = { id: 'normal' } as any
+    const distancePositionUnitNode = { id: 'distance-position' } as any
+    const provider = {
+      marker: 'cloud-shadow-provider',
+      sample: vi.fn(function (
+        this: { marker: string },
+        positionWorldNode: unknown,
+        normalWorldNode: unknown,
+        distancePositionUnitNode: unknown
+      ) {
+        return {
+          marker: this.marker,
+          positionWorldNode,
+          normalWorldNode,
+          distancePositionUnitNode
+        }
+      })
+    }
     const result = resolveCloudsAerialProviders(
       {
         context: {
-          getCloudsShadow: () => ({ sample })
+          getCloudsShadow: () => provider
         }
       } as any,
       { id: 'uv' } as any
     )
-    expect(result.sampleCloudShadow).toBe(sample)
+    expect(result.sampleCloudShadow).not.toBe(provider.sample)
+    expect(
+      result.sampleCloudShadow?.(
+        positionWorldNode,
+        normalWorldNode,
+        distancePositionUnitNode
+      )
+    ).toEqual({
+      marker: 'cloud-shadow-provider',
+      positionWorldNode,
+      normalWorldNode,
+      distancePositionUnitNode
+    })
+    expect(provider.sample).toHaveBeenCalledWith(
+      positionWorldNode,
+      normalWorldNode,
+      distancePositionUnitNode
+    )
   })
 
   test('resolves cloud shadow-length node from sampleShadowLength()', () => {
-    const sampleShadowLength = vi.fn(() => ({ id: 'shadow-length' }))
+    const sampleShadowLength = vi.fn(() => float(0.7))
+    const uvNode = { id: 'uv' } as any
     const result = resolveCloudsAerialProviders(
       {
         context: {
           getCloudsShadowLength: () => ({ sampleShadowLength })
         }
       } as any,
-      { id: 'uv' } as any
+      uvNode
     )
     expect(sampleShadowLength).toHaveBeenCalledTimes(1)
-    expect(result.shadowLengthNode).toEqual({ id: 'shadow-length' })
+    expect(sampleShadowLength).toHaveBeenCalledWith(uvNode)
+    expect(result.shadowLengthNode).not.toBeNull()
   })
 
   test('resolves cloud shadow-length node from getTextureNode().sample().r', () => {
-    const sample = vi.fn(() => ({ r: { id: 'shadow-length-from-texture' } }))
+    const sample = vi.fn(() => ({ r: float(0.5) }))
+    const uvNode = { id: 'uv' } as any
     const result = resolveCloudsAerialProviders(
       {
         context: {
@@ -91,12 +132,11 @@ describe('AerialPerspective cloud providers', () => {
           })
         }
       } as any,
-      { id: 'uv' } as any
+      uvNode
     )
     expect(sample).toHaveBeenCalledTimes(1)
-    expect(result.shadowLengthNode).toEqual({
-      id: 'shadow-length-from-texture'
-    })
+    expect(sample).toHaveBeenCalledWith(uvNode)
+    expect(result.shadowLengthNode).not.toBeNull()
   })
 })
 

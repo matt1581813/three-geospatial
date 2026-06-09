@@ -35,6 +35,11 @@
       "types": "./types/webgpu/index.d.ts",
       "import": "./build/webgpu.js",
       "require": "./build/webgpu.cjs"
+    },
+    "./webgpu/r3f": {
+      "types": "./types/webgpu/r3f/index.d.ts",
+      "import": "./build/webgpu/r3f.js",
+      "require": "./build/webgpu/r3f.cjs"
     }
   },
   "main": "./build/index.cjs",

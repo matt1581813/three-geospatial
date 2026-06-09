@@ -35,7 +35,11 @@ import type {
 } from './AtmosphereLUTTextures'
 import { AtmosphereLUTTexturesWebGL } from './AtmosphereLUTTexturesWebGL'
 import { AtmosphereLUTTexturesWebGPU } from './AtmosphereLUTTexturesWebGPU'
-import { AtmosphereParameters } from './AtmosphereParameters'
+import {
+  AtmosphereParameters,
+  type DensityProfile,
+  type DensityProfileLayer
+} from './AtmosphereParameters'
 
 const { resetRendererState, restoreRendererState } = RendererUtils
 
@@ -67,6 +71,77 @@ function run(renderer: Renderer, task: () => void): boolean {
   task()
   restoreRendererState(renderer, rendererState)
   return true
+}
+
+function hashDensityProfileLayer(layer: DensityProfileLayer): number {
+  return hash(
+    layer.width,
+    layer.expTerm,
+    layer.expScale,
+    layer.linearTerm,
+    layer.constantTerm
+  )
+}
+
+function hashDensityProfile(profile: DensityProfile): number {
+  return hash(
+    hashDensityProfileLayer(profile.layers[0]),
+    hashDensityProfileLayer(profile.layers[1])
+  )
+}
+
+function hashAtmosphereParameters(parameters: AtmosphereParameters): number {
+  return hash(
+    parameters.worldToUnit,
+    parameters.solarIrradiance.x,
+    parameters.solarIrradiance.y,
+    parameters.solarIrradiance.z,
+    parameters.sunAngularRadius,
+    parameters.bottomRadius,
+    parameters.topRadius,
+    hashDensityProfile(parameters.rayleighDensity),
+    parameters.rayleighScattering.x,
+    parameters.rayleighScattering.y,
+    parameters.rayleighScattering.z,
+    hashDensityProfile(parameters.mieDensity),
+    parameters.mieScattering.x,
+    parameters.mieScattering.y,
+    parameters.mieScattering.z,
+    parameters.mieExtinction.x,
+    parameters.mieExtinction.y,
+    parameters.mieExtinction.z,
+    parameters.miePhaseFunctionG,
+    hashDensityProfile(parameters.absorptionDensity),
+    parameters.absorptionExtinction.x,
+    parameters.absorptionExtinction.y,
+    parameters.absorptionExtinction.z,
+    parameters.groundAlbedo.x,
+    parameters.groundAlbedo.y,
+    parameters.groundAlbedo.z,
+    parameters.minCosLight,
+    parameters.sunRadianceToLuminance.x,
+    parameters.sunRadianceToLuminance.y,
+    parameters.sunRadianceToLuminance.z,
+    parameters.skyRadianceToLuminance.x,
+    parameters.skyRadianceToLuminance.y,
+    parameters.skyRadianceToLuminance.z,
+    parameters.luminanceScale,
+    +parameters.combinedScatteringTextures,
+    +parameters.higherOrderScatteringTexture,
+    parameters.transmittanceTextureSize.x,
+    parameters.transmittanceTextureSize.y,
+    parameters.irradianceTextureSize.x,
+    parameters.irradianceTextureSize.y,
+    parameters.multipleScatteringTextureSize.x,
+    parameters.multipleScatteringTextureSize.y,
+    parameters.scatteringTextureRadiusSize,
+    parameters.scatteringTextureCosViewSize,
+    parameters.scatteringTextureCosLightSize,
+    parameters.scatteringTextureCosViewLightSize,
+    parameters.scatteringTextureSize.x,
+    parameters.scatteringTextureSize.y,
+    parameters.scatteringTextureSize.z
+  )
 }
 
 export type AtmosphereLUTTextureName =
@@ -239,7 +314,10 @@ export class AtmosphereLUTNode extends Node {
       ? (this.textureType ?? FloatType)
       : HalfFloatType
     this.parameters.update()
-    const nextSetupHash = hash(this.parameters.hash(), textureType)
+    const nextSetupHash = hash(
+      hashAtmosphereParameters(this.parameters),
+      textureType
+    )
     if (this.currentSetupHash !== nextSetupHash) {
       this.textures.setup(this.parameters, textureType)
       this.currentSetupHash = nextSetupHash

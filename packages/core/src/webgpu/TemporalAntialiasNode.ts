@@ -113,6 +113,17 @@ export function biasTemporalAlphaWithCurrentFrameWeight(
   return Math.min(Math.max(baseTemporalAlpha * (1 - weight) + weight, 0), 1)
 }
 
+export function biasTemporalAlphaWithHistoryConfidence(
+  baseTemporalAlpha: number,
+  historyConfidence: number
+): number {
+  const confidence = Math.min(Math.max(historyConfidence, 0), 1)
+  return biasTemporalAlphaWithCurrentFrameWeight(
+    baseTemporalAlpha,
+    1 - confidence
+  )
+}
+
 // Reference: https://github.com/playdeadgames/temporal
 const clipAABB = /*#__PURE__*/ FnLayout({
   name: 'clipAABB',
@@ -184,7 +195,9 @@ const varianceClippingSampled = /*#__PURE__*/ FnVar(
     history: Node<'vec4'>,
     gamma: Node<'float'>
   ): Node<'vec4'> => {
-    const texelSize = vec2(1).div(vec2(textureSize(inputNode))).toConst()
+    const texelSize = vec2(1)
+      .div(vec2(textureSize(inputNode)))
+      .toConst()
     const moment1 = current.toVar()
     const moment2 = current.pow2().toVar()
 
@@ -571,7 +584,7 @@ export class TemporalAntialiasNode extends TempNode {
         .xyz.mul(vec3(0.5, -0.5, 0.5)) // Velocity is in NDC offset
         .toConst()
 
-      // Discards texels with velocity greater than the threshold:
+      // Computes a continuous history confidence from velocity magnitude:
       const velocityConfidence = this.disableVelocityRejection
         ? float(1)
         : velocityUVW.xy
@@ -596,12 +609,11 @@ export class TemporalAntialiasNode extends TempNode {
 
       const depthConfidence = this.disableDepthRejection
         ? float(1)
-        : step(
-            expectedDepth.add(velocityUVW.z),
-            prevDepth.add(this.depthError)
-          )
+        : step(expectedDepth.add(velocityUVW.z), prevDepth.add(this.depthError))
 
-      const confidence = velocityConfidence.mul(depthConfidence)
+      const historyConfidence = velocityConfidence
+        .mul(depthConfidence)
+        .saturate()
 
       const uvWeight = and(
         prevUV.greaterThanEqual(0).all(),
@@ -613,7 +625,9 @@ export class TemporalAntialiasNode extends TempNode {
         ? float(1)
         : closestDepth.notEqual(1).toFloat()
 
-      If(uvWeight.mul(depthWeight).mul(confidence).greaterThan(0), () => {
+      const historyAvailable = uvWeight.mul(depthWeight).toConst()
+
+      If(historyAvailable.greaterThan(0), () => {
         const historyColor = texture(this.historyNode, prevUV)
         const clippedColor = varianceClipping(
           this.inputNode,
@@ -632,7 +646,16 @@ export class TemporalAntialiasNode extends TempNode {
           subpixelCorrection(velocityUVW.xy, textureSize(this.inputNode))
         ).saturate()
 
-        outputColor.assign(mix(clippedColor, outputColor, temporalAlpha))
+        const historySuppression = historyConfidence.oneMinus().pow2().toConst()
+        const effectiveTemporalAlpha = mix(
+          temporalAlpha,
+          float(1),
+          historySuppression
+        ).saturate()
+
+        outputColor.assign(
+          mix(clippedColor, outputColor, effectiveTemporalAlpha)
+        )
       }).Else(() => {
         if (this.debugShowRejection) {
           outputColor.assign(vec3(1, 0, 0))
@@ -698,7 +721,8 @@ export class TemporalAntialiasNode extends TempNode {
 
 /**
  * @deprecated Function signature has been changed. Use
- *   temporalAntialias(inputNode, depthNode, velocityNode, camera, currentFrameMaskNode)
+ *   temporalAntialias(inputNode, depthNode, velocityNode, camera,
+ *   currentFrameMaskNode)
  */
 export function temporalAntialias(
   projectionMatrixController: ProjectionMatrixController

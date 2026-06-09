@@ -58,6 +58,10 @@ describe('CloudsContext', () => {
 
     expect(context.temporalUpscale).toBe(false)
     expect(context.temporalAntialias).toBe(true)
+    expect(context.discardAllHistory).toBe(false)
+    expect(context.velocityThresholdPixels).toBe(6)
+    expect(context.historyResetDistanceThreshold).toBe(100)
+    expect(context.temporalAlpha).toBeNull()
     expect(context.historyInvalidationRevision).toBe(1)
     expect(context.qualityPreset).toBe('high')
     expect(context.resolutionScale).toBe(
@@ -180,9 +184,7 @@ describe('CloudsContext', () => {
     expect(ultra.clouds.minSecondaryStepSize).toBe(
       high.clouds.minSecondaryStepSize
     )
-    expect(ultra.clouds.secondaryStepScale).toBe(
-      high.clouds.secondaryStepScale
-    )
+    expect(ultra.clouds.secondaryStepScale).toBe(high.clouds.secondaryStepScale)
     expect(ultra.clouds.maxShadowFilterRadius).toBe(
       high.clouds.maxShadowFilterRadius
     )
@@ -259,6 +261,42 @@ describe('CloudsContext', () => {
 
     context.temporalAntialias = false
     expect(context.historyInvalidationRevision).toBe(revision)
+
+    context.discardAllHistory = true
+    expect(context.historyInvalidationRevision).toBe(revision + 1)
+    revision = context.historyInvalidationRevision
+
+    context.discardAllHistory = true
+    expect(context.historyInvalidationRevision).toBe(revision)
+
+    context.velocityThresholdPixels = 9.5
+    expect(context.velocityThresholdPixels).toBe(9.5)
+    expect(context.historyInvalidationRevision).toBe(revision + 1)
+    revision = context.historyInvalidationRevision
+
+    context.velocityThresholdPixels = 9.5
+    expect(context.historyInvalidationRevision).toBe(revision)
+
+    context.historyResetDistanceThreshold = 250
+    expect(context.historyResetDistanceThreshold).toBe(250)
+    expect(context.historyInvalidationRevision).toBe(revision + 1)
+    revision = context.historyInvalidationRevision
+
+    context.historyResetDistanceThreshold = 250
+    expect(context.historyInvalidationRevision).toBe(revision)
+
+    context.temporalAlpha = 0.22
+    expect(context.temporalAlpha).toBe(0.22)
+    expect(context.historyInvalidationRevision).toBe(revision + 1)
+    revision = context.historyInvalidationRevision
+
+    context.temporalAlpha = 0.22
+    expect(context.historyInvalidationRevision).toBe(revision)
+
+    context.temporalAlpha = null
+    expect(context.temporalAlpha).toBeNull()
+    expect(context.historyInvalidationRevision).toBe(revision + 1)
+    revision = context.historyInvalidationRevision
 
     context.shapeDetail = false
     expect(context.historyInvalidationRevision).toBe(revision + 1)

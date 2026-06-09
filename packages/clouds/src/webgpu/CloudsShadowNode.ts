@@ -17,8 +17,8 @@ import {
 import { hash } from 'three/src/nodes/core/NodeUtils.js'
 import {
   Break,
-  cos,
   Continue,
+  cos,
   dot,
   exp,
   float,
@@ -35,8 +35,8 @@ import {
   select,
   sin,
   sqrt,
-  texture3D,
   texture,
+  texture3D,
   textureLevel,
   uniform,
   uv,
@@ -62,8 +62,8 @@ import {
 import {
   FnLayout,
   FnVar,
-  outputTexture,
   interleavedGradientNoise,
+  outputTexture,
   raySphereIntersection,
   raySpheresIntersections,
   viewMatrix,
@@ -91,6 +91,7 @@ const SHADOW_MIP_LEVELS = [0, 0.5, 1, 2] as const
 export const WEBGPU_CLOUD_BODY_MAX_FILTER_RADIUS = 6
 export const CLOUD_SHADOW_TEMPORAL_ALPHA = 0.01
 export const CLOUD_SHADOW_VARIANCE_GAMMA = 1
+const MIPMAP_FILTER_MIN = 1004
 const CLOUD_SHADOW_CAMERA_CUT_POSITION_THRESHOLD = 1_000
 const CLOUD_SHADOW_CAMERA_CUT_ROTATION_THRESHOLD = Math.PI / 12
 const CLOUD_SHADOW_CAMERA_CUT_PROJECTION_THRESHOLD = 1e-3
@@ -104,8 +105,6 @@ const CLOUD_BODY_SHADOW_PCF_OFFSETS = [
   [-0.817194, -0.271096],
   [-0.705374, -0.668203]
 ] as const
-const HIGH_FREQUENCY_FADE_START = 20_000
-const HIGH_FREQUENCY_FADE_END = 120_000
 const varianceOffsets = [
   /*#__PURE__*/ ivec2(-1, -1),
   /*#__PURE__*/ ivec2(-1, 1),
@@ -168,7 +167,10 @@ export function getCloudShadowAtlasViewport(
   const safeCascadeCount = clampCloudShadowCascadeCount(cascadeCount)
   const width = Math.max(Math.round(mapSize.x), 1)
   const height = Math.max(Math.round(mapSize.y), 1)
-  const index = Math.min(Math.max(Math.round(cascadeIndex), 0), safeCascadeCount - 1)
+  const index = Math.min(
+    Math.max(Math.round(cascadeIndex), 0),
+    safeCascadeCount - 1
+  )
 
   return {
     x: index * width,
@@ -186,8 +188,13 @@ export function getCloudShadowCascadeDepth(
   return (viewDepth - near) / Math.max(far - near, EPSILON)
 }
 
-export function getCloudShadowCascadeFadeWidth(cascadeBoundaryDepth: number): number {
-  return Math.min(Math.max(cascadeBoundaryDepth * cascadeBoundaryDepth * 0.5, 0.004), 0.06)
+export function getCloudShadowCascadeFadeWidth(
+  cascadeBoundaryDepth: number
+): number {
+  return Math.min(
+    Math.max(cascadeBoundaryDepth * cascadeBoundaryDepth * 0.5, 0.004),
+    0.06
+  )
 }
 
 export function resolveCloudShadowCascadeIndex(
@@ -203,6 +210,52 @@ export function resolveCloudShadowCascadeIndex(
     }
   }
   return safeCascadeCount - 1
+}
+
+export function resolveCloudShadowFadedCascadeIndex(
+  cascadeDepth: number,
+  intervals: readonly Vector2[],
+  cascadeCount: number,
+  jitter: number
+): number {
+  const safeCascadeCount = clampCloudShadowCascadeCount(cascadeCount)
+  let nextIndex = -1
+  let prevIndex = -1
+  let alpha = 0
+
+  for (let index = 0; index < safeCascadeCount; ++index) {
+    const interval = intervals[index] ?? new Vector2(0, 1)
+    const intervalCenter = (interval.x + interval.y) * 0.5
+    const closestEdge = cascadeDepth < intervalCenter ? interval.x : interval.y
+    const margin = closestEdge * closestEdge * 0.5
+    const expandedMin = interval.x - margin * 0.5
+    const expandedMax = interval.y + margin * 0.5
+    const safeMargin = Math.max(margin, EPSILON)
+
+    if (index < safeCascadeCount - 1) {
+      if (cascadeDepth >= expandedMin && cascadeDepth < expandedMax) {
+        prevIndex = nextIndex
+        nextIndex = index
+        alpha = Math.min(
+          Math.max(
+            Math.min(cascadeDepth - expandedMin, expandedMax - cascadeDepth) /
+              safeMargin,
+            0
+          ),
+          1
+        )
+      }
+    } else if (cascadeDepth >= expandedMin) {
+      prevIndex = nextIndex
+      nextIndex = index
+      alpha = Math.min(
+        Math.max((cascadeDepth - expandedMin) / safeMargin, 0),
+        1
+      )
+    }
+  }
+
+  return jitter <= alpha ? nextIndex : prevIndex
 }
 
 export function getCloudShadowCascadeBlendWeights(
@@ -221,7 +274,8 @@ export function getCloudShadowCascadeBlendWeights(
     safeCascadeCount > 1
       ? Math.min(
           Math.max(
-            (cascadeDepth - (split01 - fade01 * 0.5)) / Math.max(fade01, EPSILON),
+            (cascadeDepth - (split01 - fade01 * 0.5)) /
+              Math.max(fade01, EPSILON),
             0
           ),
           1
@@ -231,7 +285,8 @@ export function getCloudShadowCascadeBlendWeights(
     safeCascadeCount > 2
       ? Math.min(
           Math.max(
-            (cascadeDepth - (split12 - fade12 * 0.5)) / Math.max(fade12, EPSILON),
+            (cascadeDepth - (split12 - fade12 * 0.5)) /
+              Math.max(fade12, EPSILON),
             0
           ),
           1
@@ -241,7 +296,8 @@ export function getCloudShadowCascadeBlendWeights(
     safeCascadeCount > 3
       ? Math.min(
           Math.max(
-            (cascadeDepth - (split23 - fade23 * 0.5)) / Math.max(fade23, EPSILON),
+            (cascadeDepth - (split23 - fade23 * 0.5)) /
+              Math.max(fade23, EPSILON),
             0
           ),
           1
@@ -284,6 +340,19 @@ export function computeCloudShadowOpticalDepth(
   )
 }
 
+export function computeCloudShadowSurfaceOpticalDepth(
+  distanceToTop: number,
+  frontDepth: number,
+  meanExtinction: number,
+  maxOpticalDepth: number
+): number {
+  const distanceToFront = Math.max(0, distanceToTop - frontDepth)
+  return Math.min(
+    Math.max(maxOpticalDepth, 0),
+    Math.max(meanExtinction, 0) * distanceToFront
+  )
+}
+
 export function computeCloudShadowOpticalDepthTail(
   stepSizeWorld: number,
   sampleCount: number,
@@ -301,8 +370,7 @@ export function computeCloudShadowFilterRadius(
 ): number {
   return (
     Math.max(maxFilterRadius, 0) *
-    (1 -
-      Math.min(Math.max(sunDotSurfaceNormal / 0.1, 0), 1))
+    (1 - Math.min(Math.max(sunDotSurfaceNormal / 0.1, 0), 1))
   )
 }
 
@@ -339,6 +407,76 @@ const getGlobeUv = /*#__PURE__*/ Fn(([position]: [Node<'vec3'>]) => {
   return uvCoord.mul(0.5).add(0.5)
 })
 
+const getCloudShadowStructureNormal = /*#__PURE__*/ Fn(
+  ([direction, jitter]: [Node<'vec3'>, Node<'float'>]) => {
+    const a = 0.85065080835204
+    const b = 0.5257311121191336
+    const kT = 0.6180339887498948
+    const kT2 = 0.38196601125010515
+    const absDirection = direction.abs().toConst()
+    const octantSign = direction.sign().toConst()
+    const selector1 = dot(absDirection, vec3(1, kT2, -kT)).toConst()
+    const selector2 = dot(absDirection, vec3(-kT, 1, kT2)).toConst()
+    const selector3 = dot(absDirection, vec3(kT2, -kT, 1)).toConst()
+    const v1 = select(
+      selector1.greaterThan(0),
+      vec3(a, b, 0),
+      vec3(-b, 0, a)
+    )
+      .mul(octantSign)
+      .toConst()
+    const v2 = select(
+      selector2.greaterThan(0),
+      vec3(0, a, b),
+      vec3(a, -b, 0)
+    )
+      .mul(octantSign)
+      .toConst()
+    const v3 = select(
+      selector3.greaterThan(0),
+      vec3(b, 0, a),
+      vec3(0, a, -b)
+    )
+      .mul(octantSign)
+      .toConst()
+    const base = vec3(0.5, 0.5, 1).toConst()
+    const aw = vec4(v1, dot(v1, base)).toVar()
+    const bw = vec4(v2, dot(v2, base)).toVar()
+    const cw = vec4(v3, dot(v3, base)).toVar()
+
+    If(aw.w.greaterThan(bw.w), () => {
+      const t = aw.toConst()
+      aw.assign(bw)
+      bw.assign(t)
+    })
+    If(bw.w.greaterThan(cw.w), () => {
+      const t = bw.toConst()
+      bw.assign(cw)
+      cw.assign(t)
+    })
+    If(aw.w.greaterThan(bw.w), () => {
+      const t = aw.toConst()
+      aw.assign(bw)
+      bw.assign(t)
+    })
+
+    const weights = exp(
+      vec3(
+        dot(aw.xyz, direction),
+        dot(bw.xyz, direction),
+        dot(cw.xyz, direction)
+      ).mul(40)
+    ).toVar()
+    weights.assign(weights.div(weights.x.add(weights.y).add(weights.z)))
+
+    return select(
+      jitter.lessThan(weights.x),
+      aw.xyz,
+      select(jitter.lessThan(weights.x.add(weights.y)), bw.xyz, cw.xyz)
+    )
+  }
+)
+
 function isPerspectiveCamera(camera: Camera): camera is PerspectiveCamera {
   return camera.isPerspectiveCamera === true
 }
@@ -349,6 +487,32 @@ function getMaxMatrixDelta(a: Matrix4, b: Matrix4): number {
     delta = Math.max(delta, Math.abs(a.elements[i] - b.elements[i]))
   }
   return delta
+}
+
+function supportsMipmappedSampling(texture: Texture): boolean {
+  if ((texture.mipmaps?.length ?? 0) > 0) {
+    return true
+  }
+  return texture.generateMipmaps || texture.minFilter >= MIPMAP_FILTER_MIN
+}
+
+function getTextureMaxMipLevel(texture: Texture): number {
+  if (!supportsMipmappedSampling(texture)) {
+    return 0
+  }
+
+  const image = (texture.source?.data ?? texture.image) as
+    | {
+        width?: number
+        height?: number
+        depth?: number
+      }
+    | undefined
+  const width = Math.max(Math.floor(image?.width ?? 1), 1)
+  const height = Math.max(Math.floor(image?.height ?? 1), 1)
+  const depth = Math.max(Math.floor(image?.depth ?? 1), 1)
+  const maxDimension = Math.max(width, height, depth)
+  return Math.max(0, Math.floor(Math.log2(maxDimension)))
 }
 
 const clipAABB = /*#__PURE__*/ FnLayout({
@@ -389,7 +553,10 @@ const varianceClippingTile = /*#__PURE__*/ FnVar(
     const moment2 = current.pow2().toVar()
 
     for (const offset of varianceOffsets) {
-      const neighborCoord = coord.add(offset).clamp(tileOrigin, tileMaxCoord).toConst()
+      const neighborCoord = coord
+        .add(offset)
+        .clamp(tileOrigin, tileMaxCoord)
+        .toConst()
       const neighbor = inputNode.load(neighborCoord).toConst()
       moment1.addAssign(neighbor)
       moment2.addAssign(neighbor.pow2())
@@ -427,7 +594,10 @@ export class CloudsShadowNode extends TempNode {
     })
   private resolveRenderTarget = this.createRenderTarget('Resolve')
   private historyRenderTarget = this.createRenderTarget('History')
-  private readonly textureNode = outputTexture(this, this.resolveRenderTarget.texture)
+  private readonly textureNode = outputTexture(
+    this,
+    this.resolveRenderTarget.texture
+  )
   private readonly currentMaterial = new NodeMaterial()
   private readonly resolveMaterial = new NodeMaterial()
   private readonly currentMesh = new QuadMesh(this.currentMaterial)
@@ -436,14 +606,25 @@ export class CloudsShadowNode extends TempNode {
 
   private readonly localWeatherNode = texture(fallbackLocalWeatherTexture)
   private readonly shapeTextureNode = texture3D(fallbackShapeTexture)
-  private readonly shapeDetailTextureNode = texture3D(fallbackShapeDetailTexture)
-  private readonly turbulenceTextureNode = texture(fallbackTurbulenceTexture)
-
-  private readonly currentInverseShadowMatrixNode = uniform(new Matrix4()).setName(
-    'cloudsShadowInverseMatrix'
+  private readonly shapeDetailTextureNode = texture3D(
+    fallbackShapeDetailTexture
   )
-  private readonly currentReprojectionMatrixNode = uniform(new Matrix4()).setName(
-    'cloudsShadowReprojectionMatrix'
+  private readonly turbulenceTextureNode = texture(fallbackTurbulenceTexture)
+  private readonly shapeTextureMipLevelMaxNode = uniform(0).setName(
+    'cloudsShadowShapeTextureMipLevelMax'
+  )
+  private readonly shapeDetailTextureMipLevelMaxNode = uniform(0).setName(
+    'cloudsShadowShapeDetailTextureMipLevelMax'
+  )
+
+  private readonly currentInverseShadowMatrixNode = uniform(
+    new Matrix4()
+  ).setName('cloudsShadowInverseMatrix')
+  private readonly currentReprojectionMatrixNode = uniform(
+    new Matrix4()
+  ).setName('cloudsShadowReprojectionMatrix')
+  private readonly currentShadowCascadeIndexNode = uniform(0, 'int').setName(
+    'cloudsShadowCurrentCascadeIndex'
   )
   private readonly currentShadowMipLevelNode = uniform(0).setName(
     'cloudsShadowMipLevel'
@@ -471,8 +652,7 @@ export class CloudsShadowNode extends TempNode {
   )
   private readonly shadowMatrixNodes = Array.from(
     { length: MAX_CLOUD_SHADOW_CASCADES },
-    (_, index) =>
-      uniform(new Matrix4()).setName(`cloudsShadowMatrix${index}`)
+    (_, index) => uniform(new Matrix4()).setName(`cloudsShadowMatrix${index}`)
   )
 
   private readonly maxIterationCountNode = uniform(50, 'int').setName(
@@ -518,12 +698,16 @@ export class CloudsShadowNode extends TempNode {
     super('vec4')
 
     if (!isPerspectiveCamera(camera)) {
-      throw new Error('CloudsShadowNode currently requires a PerspectiveCamera.')
+      throw new Error(
+        'CloudsShadowNode currently requires a PerspectiveCamera.'
+      )
     }
     this.camera = camera
 
-    this.currentRenderTargets.getTexture('depthVelocity').minFilter = NearestFilter
-    this.currentRenderTargets.getTexture('depthVelocity').magFilter = NearestFilter
+    this.currentRenderTargets.getTexture('depthVelocity').minFilter =
+      NearestFilter
+    this.currentRenderTargets.getTexture('depthVelocity').magFilter =
+      NearestFilter
     this.currentMaterial.name = 'CloudsShadowNode.Current'
     this.resolveMaterial.name = 'CloudsShadowNode.Resolve'
 
@@ -555,7 +739,10 @@ export class CloudsShadowNode extends TempNode {
     return this.textureNode
   }
 
-  setContexts(cloudsContext: CloudsContext, atmosphereContext: AtmosphereContext): void {
+  setContexts(
+    cloudsContext: CloudsContext,
+    atmosphereContext: AtmosphereContext
+  ): void {
     this.cloudsContext = cloudsContext
     this.atmosphereContext = atmosphereContext
   }
@@ -582,7 +769,9 @@ export class CloudsShadowNode extends TempNode {
         .all()
         .and(localUv.lessThanEqual(vec2(1)).all())
         .toConst()
-      const texelSize = this.shadowTileTexelSizeNode.mul(filterScaleNode).toConst()
+      const texelSize = this.shadowTileTexelSizeNode
+        .mul(filterScaleNode)
+        .toConst()
       const minLocalUv = texelSize.mul(0.5).toConst()
       const maxLocalUv = vec2(1).sub(minLocalUv).toConst()
 
@@ -675,9 +864,10 @@ export class CloudsShadowNode extends TempNode {
     }
 
     return Fn(() => {
-      const normalOffset = normalWorldNode != null
-        ? normalWorldNode.normalize().mul(this.shadowNormalBiasNode)
-        : vec3(0)
+      const normalOffset =
+        normalWorldNode != null
+          ? normalWorldNode.normalize().mul(this.shadowNormalBiasNode)
+          : vec3(0)
       const samplePositionWorld = positionWorldNode.add(normalOffset).toConst()
       const depthView = viewMatrix(camera)
         .mul(vec4(samplePositionWorld, 1))
@@ -717,108 +907,70 @@ export class CloudsShadowNode extends TempNode {
         receiverFilterScale
       ).toConst()
 
-      const valid0 = sample0.greaterThanEqual(0).toConst()
-      const valid1 = sample1.greaterThanEqual(0).toConst()
-      const valid2 = sample2.greaterThanEqual(0).toConst()
-      const valid3 = sample3.greaterThanEqual(0).toConst()
-
-      const hasCascade1 = this.shadowCascadeCountNode.greaterThan(1).toConst()
-      const hasCascade2 = this.shadowCascadeCountNode.greaterThan(2).toConst()
-      const hasCascade3 = this.shadowCascadeCountNode.greaterThan(3).toConst()
-
-      const split01 = this.shadowIntervalNodes[0].y.toConst()
-      const split12 = this.shadowIntervalNodes[1].y.toConst()
-      const split23 = this.shadowIntervalNodes[2].y.toConst()
-      const fade01 = split01
-        .pow2()
-        .mul(0.5)
-        .clamp(0.004, 0.06)
+      const jitter = interleavedGradientNoise(vec2(screenCoordinate.xy))
+        .clamp(0, 1)
         .toConst()
-      const fade12 = split12
-        .pow2()
-        .mul(0.5)
-        .clamp(0.004, 0.06)
-        .toConst()
-      const fade23 = split23
-        .pow2()
-        .mul(0.5)
-        .clamp(0.004, 0.06)
-        .toConst()
+      const prevSample = vec4(0).toVar()
+      const nextSample = vec4(0).toVar()
+      const cascadeAlpha = float(0).toVar()
+      const chooseCascade = (
+        cascadeIndex: number,
+        sample: Node<'vec4'>
+      ): void => {
+        const interval = this.shadowIntervalNodes[cascadeIndex]
+        const center = interval.x.add(interval.y).mul(0.5).toConst()
+        const closestEdge = select(
+          cascadeDepth.lessThan(center),
+          interval.x,
+          interval.y
+        ).toConst()
+        const margin = closestEdge.pow2().mul(0.5).toConst()
+        const expandedMin = interval.x.sub(margin.mul(0.5)).toConst()
+        const expandedMax = interval.y.add(margin.mul(0.5)).toConst()
+        const safeMargin = max(margin, float(EPSILON)).toConst()
+        const active = this.shadowCascadeCountNode
+          .greaterThan(cascadeIndex)
+          .toConst()
+        const isLast = this.shadowCascadeCountNode
+          .equal(cascadeIndex + 1)
+          .toConst()
+        const insideNonLast = isLast
+          .not()
+          .and(cascadeDepth.greaterThanEqual(expandedMin))
+          .and(cascadeDepth.lessThan(expandedMax))
+          .toConst()
+        const insideLast = isLast
+          .and(cascadeDepth.greaterThanEqual(expandedMin))
+          .toConst()
+        const alpha = select(
+          isLast,
+          cascadeDepth.sub(expandedMin).div(safeMargin).clamp(0, 1),
+          min(
+            cascadeDepth.sub(expandedMin),
+            expandedMax.sub(cascadeDepth)
+          )
+            .div(safeMargin)
+            .clamp(0, 1)
+        ).toConst()
 
-      const transition01 = select(
-        hasCascade1,
-        remapClamp(
-          cascadeDepth,
-          split01.sub(fade01.mul(0.5)),
-          split01.add(fade01.mul(0.5))
-        ),
-        float(0)
-      ).toConst()
-      const transition12 = select(
-        hasCascade2,
-        remapClamp(
-          cascadeDepth,
-          split12.sub(fade12.mul(0.5)),
-          split12.add(fade12.mul(0.5))
-        ),
-        float(0)
-      ).toConst()
-      const transition23 = select(
-        hasCascade3,
-        remapClamp(
-          cascadeDepth,
-          split23.sub(fade23.mul(0.5)),
-          split23.add(fade23.mul(0.5))
-        ),
-        float(0)
-      ).toConst()
+        If(active.and(insideNonLast.or(insideLast)), () => {
+          prevSample.assign(nextSample)
+          nextSample.assign(
+            select(sample.x.greaterThanEqual(0), sample, vec4(0))
+          )
+          cascadeAlpha.assign(alpha)
+        })
+      }
 
-      const weight0 = float(1).sub(transition01).toConst()
-      const weight1 = select(
-        hasCascade1,
-        select(
-          hasCascade2,
-          transition01.mul(float(1).sub(transition12)),
-          transition01
-        ),
-        float(0)
-      ).toConst()
-      const weight2 = select(
-        hasCascade2,
-        select(
-          hasCascade3,
-          transition12.mul(float(1).sub(transition23)),
-          transition12
-        ),
-        float(0)
-      ).toConst()
-      const weight3 = select(hasCascade3, transition23, float(0)).toConst()
-
-      const weightedSum = vec4(0)
-        .add(select(valid0, sample0, vec4(0)).mul(weight0))
-        .add(select(valid1, sample1, vec4(0)).mul(weight1))
-        .add(select(valid2, sample2, vec4(0)).mul(weight2))
-        .add(select(valid3, sample3, vec4(0)).mul(weight3))
-        .toConst()
-      const totalWeight = select(valid0, weight0, float(0))
-        .add(select(valid1, weight1, float(0)))
-        .add(select(valid2, weight2, float(0)))
-        .add(select(valid3, weight3, float(0)))
-        .toConst()
-      const fallbackSample = select(
-        valid0,
-        sample0,
-        select(
-          valid1,
-          sample1,
-          select(valid2, sample2, select(valid3, sample3, vec4(0)))
-        )
-      ).toConst()
+      chooseCascade(0, sample0)
+      chooseCascade(1, sample1)
+      chooseCascade(2, sample2)
+      chooseCascade(3, sample3)
 
       return select(
-        totalWeight.greaterThan(EPSILON),
-        weightedSum.div(totalWeight),
-        fallbackSample
+        jitter.lessThanEqual(cascadeAlpha),
+        nextSample,
+        prevSample
       )
     })()
   }
@@ -869,7 +1021,11 @@ export class CloudsShadowNode extends TempNode {
       const pcfSample = pcfSum
         .div(float(CLOUD_BODY_SHADOW_PCF_OFFSETS.length))
         .toConst()
-      const sampled = select(radius.greaterThan(0.1), pcfSample, centerSample).toConst()
+      const sampled = select(
+        radius.greaterThan(0.1),
+        pcfSample,
+        centerSample
+      ).toConst()
 
       return select(inBounds, sampled, vec4(-1))
     }
@@ -905,107 +1061,68 @@ export class CloudsShadowNode extends TempNode {
         samplePositionWorld
       ).toConst()
 
-      const valid0 = sample0.x.greaterThanEqual(0).toConst()
-      const valid1 = sample1.x.greaterThanEqual(0).toConst()
-      const valid2 = sample2.x.greaterThanEqual(0).toConst()
-      const valid3 = sample3.x.greaterThanEqual(0).toConst()
+      const jitter = (cascadeJitterNode ?? float(0)).clamp(0, 1).toConst()
+      const prevSample = vec4(0).toVar()
+      const nextSample = vec4(0).toVar()
+      const cascadeAlpha = float(0).toVar()
+      const chooseCascade = (
+        cascadeIndex: number,
+        sample: Node<'vec4'>
+      ): void => {
+        const interval = this.shadowIntervalNodes[cascadeIndex]
+        const center = interval.x.add(interval.y).mul(0.5).toConst()
+        const closestEdge = select(
+          cascadeDepth.lessThan(center),
+          interval.x,
+          interval.y
+        ).toConst()
+        const margin = closestEdge.pow2().mul(0.5).toConst()
+        const expandedMin = interval.x.sub(margin.mul(0.5)).toConst()
+        const expandedMax = interval.y.add(margin.mul(0.5)).toConst()
+        const safeMargin = max(margin, float(EPSILON)).toConst()
+        const active = this.shadowCascadeCountNode
+          .greaterThan(cascadeIndex)
+          .toConst()
+        const isLast = this.shadowCascadeCountNode
+          .equal(cascadeIndex + 1)
+          .toConst()
+        const insideNonLast = isLast
+          .not()
+          .and(cascadeDepth.greaterThanEqual(expandedMin))
+          .and(cascadeDepth.lessThan(expandedMax))
+          .toConst()
+        const insideLast = isLast
+          .and(cascadeDepth.greaterThanEqual(expandedMin))
+          .toConst()
+        const alpha = select(
+          isLast,
+          cascadeDepth.sub(expandedMin).div(safeMargin).clamp(0, 1),
+          min(
+            cascadeDepth.sub(expandedMin),
+            expandedMax.sub(cascadeDepth)
+          )
+            .div(safeMargin)
+            .clamp(0, 1)
+        ).toConst()
 
-      const hasCascade1 = this.shadowCascadeCountNode.greaterThan(1).toConst()
-      const hasCascade2 = this.shadowCascadeCountNode.greaterThan(2).toConst()
-      const hasCascade3 = this.shadowCascadeCountNode.greaterThan(3).toConst()
-      const split01 = this.shadowIntervalNodes[0].y.toConst()
-      const split12 = this.shadowIntervalNodes[1].y.toConst()
-      const split23 = this.shadowIntervalNodes[2].y.toConst()
-      const fade01 = split01
-        .pow2()
-        .mul(0.5)
-        .clamp(0.004, 0.06)
-        .toConst()
-      const fade12 = split12
-        .pow2()
-        .mul(0.5)
-        .clamp(0.004, 0.06)
-        .toConst()
-      const fade23 = split23
-        .pow2()
-        .mul(0.5)
-        .clamp(0.004, 0.06)
-        .toConst()
+        If(active.and(insideNonLast.or(insideLast)), () => {
+          prevSample.assign(nextSample)
+          nextSample.assign(
+            select(sample.x.greaterThanEqual(0), sample, vec4(0))
+          )
+          cascadeAlpha.assign(alpha)
+        })
+      }
 
-      const transition01 = select(
-        hasCascade1,
-        remapClamp(
-          cascadeDepth,
-          split01.sub(fade01.mul(0.5)),
-          split01.add(fade01.mul(0.5))
-        ),
-        float(0)
-      ).toConst()
-      const transition12 = select(
-        hasCascade2,
-        remapClamp(
-          cascadeDepth,
-          split12.sub(fade12.mul(0.5)),
-          split12.add(fade12.mul(0.5))
-        ),
-        float(0)
-      ).toConst()
-      const transition23 = select(
-        hasCascade3,
-        remapClamp(
-          cascadeDepth,
-          split23.sub(fade23.mul(0.5)),
-          split23.add(fade23.mul(0.5))
-        ),
-        float(0)
-      ).toConst()
-
-      const weight0 = float(1).sub(transition01).toConst()
-      const weight1 = select(
-        hasCascade1,
-        select(
-          hasCascade2,
-          transition01.mul(float(1).sub(transition12)),
-          transition01
-        ),
-        float(0)
-      ).toConst()
-      const weight2 = select(
-        hasCascade2,
-        select(
-          hasCascade3,
-          transition12.mul(float(1).sub(transition23)),
-          transition12
-        ),
-        float(0)
-      ).toConst()
-      const weight3 = select(hasCascade3, transition23, float(0)).toConst()
-
-      const weightedSum = vec4(0)
-        .add(select(valid0, sample0, vec4(0)).mul(weight0))
-        .add(select(valid1, sample1, vec4(0)).mul(weight1))
-        .add(select(valid2, sample2, vec4(0)).mul(weight2))
-        .add(select(valid3, sample3, vec4(0)).mul(weight3))
-        .toConst()
-      const totalWeight = select(valid0, weight0, float(0))
-        .add(select(valid1, weight1, float(0)))
-        .add(select(valid2, weight2, float(0)))
-        .add(select(valid3, weight3, float(0)))
-        .toConst()
-      const fallbackSample = select(
-        valid0,
-        sample0,
-        select(
-          valid1,
-          sample1,
-          select(valid2, sample2, select(valid3, sample3, vec4(0)))
-        )
-      ).toConst()
+      chooseCascade(0, sample0)
+      chooseCascade(1, sample1)
+      chooseCascade(2, sample2)
+      chooseCascade(3, sample3)
 
       return select(
-        totalWeight.greaterThan(EPSILON),
-        weightedSum.div(totalWeight),
-        fallbackSample
+        jitter.lessThanEqual(cascadeAlpha),
+        nextSample,
+        prevSample
       )
     })()
   }
@@ -1084,12 +1201,55 @@ export class CloudsShadowNode extends TempNode {
 
   sample(
     positionWorldNode: Node<'vec3'>,
-    normalWorldNode: Node<'vec3'> | null = null
+    normalWorldNode: Node<'vec3'> | null = null,
+    distancePositionUnitNode: Node<'vec3'> | null = null
   ): Node<'float'> {
+    const atmosphere = this.atmosphereContext
+    const clouds = this.cloudsContext
+    if (atmosphere == null || clouds == null) {
+      throw new Error(
+        'CloudsShadowNode.sample() requires AtmosphereContext and CloudsContext.'
+      )
+    }
+
     return exp(
-      this.sampleOpticalDepth(positionWorldNode, float(0), normalWorldNode, {
-        filtered: true
-      }).negate()
+      Fn(() => {
+        const samplePositionWorld = positionWorldNode
+          .add(
+            normalWorldNode != null
+              ? normalWorldNode.normalize().mul(this.shadowNormalBiasNode)
+              : vec3(0)
+          )
+          .toConst()
+        const shadow = this.sampleData(samplePositionWorld, null, {
+          filtered: true
+        }).toConst()
+        const samplePositionUnit = (
+          distancePositionUnitNode ??
+          atmosphere.matrixWorldToECEF
+            .mul(vec4(samplePositionWorld, 1))
+            .xyz.mul(atmosphere.worldToUnit)
+            .add(atmosphere.altitudeCorrectionUnit)
+        ).toConst()
+        const shadowTopRadius = atmosphere.bottomRadius
+          .add(clouds.shadowMaxHeightNode.mul(atmosphere.worldToUnit))
+          .toConst()
+        const distanceToTopUnit = raySphereIntersection(
+          samplePositionUnit,
+          atmosphere.sunDirectionECEF.normalize(),
+          vec3(0),
+          shadowTopRadius
+        )
+          .y.max(0)
+          .toConst()
+        const distanceToTopWorld = distanceToTopUnit
+          .div(atmosphere.worldToUnit)
+          .toConst()
+        const distanceToFront = distanceToTopWorld.sub(shadow.x).max(0)
+
+        return min(shadow.z, shadow.y.mul(distanceToFront)).max(0).toConst()
+      })()
+        .negate()
     )
       .saturate()
       .toConst()
@@ -1124,11 +1284,16 @@ export class CloudsShadowNode extends TempNode {
     cameraPositionScratch.setFromMatrixPosition(this.camera.matrixWorld)
     cameraQuaternionScratch.setFromRotationMatrix(this.camera.matrixWorld)
 
-    const positionDelta = cameraPositionScratch.distanceTo(this.previousCameraPosition)
+    const positionDelta = cameraPositionScratch.distanceTo(
+      this.previousCameraPosition
+    )
     const rotationDelta =
       2 *
       Math.acos(
-        Math.min(1, Math.abs(cameraQuaternionScratch.dot(this.previousCameraQuaternion)))
+        Math.min(
+          1,
+          Math.abs(cameraQuaternionScratch.dot(this.previousCameraQuaternion))
+        )
       )
     const projectionDelta = getMaxMatrixDelta(
       projectionMatrix,
@@ -1165,6 +1330,12 @@ export class CloudsShadowNode extends TempNode {
     this.shapeTextureNode.value = clouds.resolvedShapeTexture
     this.shapeDetailTextureNode.value = clouds.resolvedShapeDetailTexture
     this.turbulenceTextureNode.value = clouds.resolvedTurbulenceTexture
+    this.shapeTextureMipLevelMaxNode.value = getTextureMaxMipLevel(
+      clouds.resolvedShapeTexture
+    )
+    this.shapeDetailTextureMipLevelMaxNode.value = getTextureMaxMipLevel(
+      clouds.resolvedShapeDetailTexture
+    )
     this.temporalState.observe(clouds)
 
     const shadow = clouds.shadow
@@ -1235,7 +1406,8 @@ export class CloudsShadowNode extends TempNode {
 
     const atlasSize = getCloudShadowAtlasSize(mapSize, cascadeCount)
     const resized = this.setSize(atlasSize.x, atlasSize.y)
-    const useHistory = this.previousFrameValid && !historyResetRequested && !resized
+    const useHistory =
+      this.previousFrameValid && !historyResetRequested && !resized
     this.resolveHistoryWeightNode.value = useHistory ? 1 : 0
 
     renderer.getViewport(viewportScratch)
@@ -1257,10 +1429,22 @@ export class CloudsShadowNode extends TempNode {
       this.currentReprojectionMatrixNode.value.copy(
         useHistory ? this.previousShadowMatrices[index] : cascade.matrix
       )
-      this.currentShadowMipLevelNode.value = SHADOW_MIP_LEVELS[index] ?? SHADOW_MIP_LEVELS.at(-1)!
+      this.currentShadowCascadeIndexNode.value = index
+      this.currentShadowMipLevelNode.value =
+        SHADOW_MIP_LEVELS[index] ?? SHADOW_MIP_LEVELS.at(-1)!
 
-      renderer.setViewport(viewport.x, viewport.y, viewport.width, viewport.height)
-      renderer.setScissor(viewport.x, viewport.y, viewport.width, viewport.height)
+      renderer.setViewport(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height
+      )
+      renderer.setScissor(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height
+      )
       renderer.setScissorTest(true)
       this.currentMesh.material = this.currentMaterial
       this.currentMesh.render(renderer)
@@ -1281,7 +1465,9 @@ export class CloudsShadowNode extends TempNode {
 
     this.swapBuffers()
     for (let index = 0; index < cascadeCount; ++index) {
-      this.previousShadowMatrices[index].copy(this.shadowMaps.cascades[index].matrix)
+      this.previousShadowMatrices[index].copy(
+        this.shadowMaps.cascades[index].matrix
+      )
     }
     this.previousFrameValid = true
     this.cacheCameraPose(this.camera.projectionMatrix)
@@ -1302,7 +1488,8 @@ export class CloudsShadowNode extends TempNode {
 
   private setupResolveFragmentNode(): Node {
     const currentShadowNode = this.currentRenderTargets.getTextureNode('shadow')
-    const depthVelocityNode = this.currentRenderTargets.getTextureNode('depthVelocity')
+    const depthVelocityNode =
+      this.currentRenderTargets.getTextureNode('depthVelocity')
 
     const fragmentNode = Fn(() => {
       const coord = ivec2(screenCoordinate).toConst()
@@ -1315,7 +1502,10 @@ export class CloudsShadowNode extends TempNode {
       const tileOrigin = ivec2(cascadeIndex.mul(tileSize.x), 0).toConst()
       const tileMaxCoord = tileOrigin.add(tileSize).sub(1).toConst()
       const localCoord = coord.sub(tileOrigin).toConst()
-      const localUv = vec2(localCoord).add(0.5).mul(this.shadowTileTexelSizeNode).toConst()
+      const localUv = vec2(localCoord)
+        .add(0.5)
+        .mul(this.shadowTileTexelSizeNode)
+        .toConst()
       const outputColor = currentShadowNode.load(coord).toVar()
 
       If(this.resolveHistoryWeightNode.greaterThan(EPSILON), () => {
@@ -1323,8 +1513,13 @@ export class CloudsShadowNode extends TempNode {
         const closestDepth = float(1e9).toVar()
 
         for (const offset of closestNeighborOffsets) {
-          const neighborCoord = coord.add(offset).clamp(tileOrigin, tileMaxCoord).toConst()
-          const neighborDepth = depthVelocityNode.load(neighborCoord).r.toConst()
+          const neighborCoord = coord
+            .add(offset)
+            .clamp(tileOrigin, tileMaxCoord)
+            .toConst()
+          const neighborDepth = depthVelocityNode
+            .load(neighborCoord)
+            .r.toConst()
           If(neighborDepth.lessThan(closestDepth), () => {
             closestCoord.assign(neighborCoord)
             closestDepth.assign(neighborDepth)
@@ -1332,7 +1527,9 @@ export class CloudsShadowNode extends TempNode {
         }
 
         const depthVelocity = depthVelocityNode.load(closestCoord).toConst()
-        const velocityUv = depthVelocity.gb.mul(this.shadowTileTexelSizeNode).toConst()
+        const velocityUv = depthVelocity.gb
+          .mul(this.shadowTileTexelSizeNode)
+          .toConst()
         const prevLocalUv = localUv.sub(velocityUv).toConst()
         const insideHistory = prevLocalUv
           .greaterThanEqual(vec2(0))
@@ -1342,7 +1539,9 @@ export class CloudsShadowNode extends TempNode {
 
         If(insideHistory, () => {
           const prevAtlasUv = vec2(
-            prevLocalUv.x.add(cascadeIndex.toFloat()).div(this.shadowCascadeCountNode.toFloat()),
+            prevLocalUv.x
+              .add(cascadeIndex.toFloat())
+              .div(this.shadowCascadeCountNode.toFloat()),
             prevLocalUv.y
           ).toConst()
           const historyColor = this.historyNode.sample(prevAtlasUv).toConst()
@@ -1378,7 +1577,7 @@ export class CloudsShadowNode extends TempNode {
     ).toConst()
 
     const sampleExtinctionAt = Fn(
-      ([positionUnit, mipLevel, highFrequencyWeight]: [
+      ([positionUnit, mipLevel, jitter]: [
         Node<'vec3'>,
         Node<'float'>,
         Node<'float'>
@@ -1386,14 +1585,29 @@ export class CloudsShadowNode extends TempNode {
         const height = positionUnit
           .length()
           .sub(atmosphere.bottomRadius)
-          .mul(unitToWorld)
-          .toConst()
+            .mul(unitToWorld)
+            .toConst()
         const extinction = float(0).toVar()
+        const heightInsideLayerGap = height
+          .greaterThan(clouds.minIntervalHeightsNode.x)
+          .and(height.lessThan(clouds.maxIntervalHeightsNode.x))
+          .or(
+            height
+              .greaterThan(clouds.minIntervalHeightsNode.y)
+              .and(height.lessThan(clouds.maxIntervalHeightsNode.y))
+          )
+          .or(
+            height
+              .greaterThan(clouds.minIntervalHeightsNode.z)
+              .and(height.lessThan(clouds.maxIntervalHeightsNode.z))
+          )
+          .toConst()
 
         If(
           height
             .greaterThanEqual(clouds.shadowMinHeightNode)
-            .and(height.lessThanEqual(clouds.shadowMaxHeightNode)),
+            .and(height.lessThanEqual(clouds.shadowMaxHeightNode))
+            .and(heightInsideLayerGap.not()),
           () => {
             const weatherUv = getGlobeUv(positionUnit)
             const weatherCoord = weatherUv
@@ -1434,19 +1648,14 @@ export class CloudsShadowNode extends TempNode {
               coverageFactor,
               coverageFactor.add(clouds.coverageFilterWidthsNode)
             ).toVar()
-            const weatherDensityMean = weatherDensity.x
-              .add(weatherDensity.y)
-              .add(weatherDensity.z)
-              .add(weatherDensity.w)
-              .mul(0.25)
+            const hasRoughDensity = weatherDensity
+              .greaterThan(vec4(this.minDensityNode))
+              .any()
               .toConst()
-            const edgeFade = remapClamp(
-              weatherDensityMean,
-              float(0.05),
-              float(0.22)
-            ).toConst()
             const positionWorld = positionUnit.mul(unitToWorld).toConst()
-            const localWeatherSpeed = clouds.localWeatherOffsetNode.length().toConst()
+            const localWeatherSpeed = clouds.localWeatherOffsetNode
+              .length()
+              .toConst()
             const evolution = positionWorld
               .normalize()
               .negate()
@@ -1455,13 +1664,11 @@ export class CloudsShadowNode extends TempNode {
               .toConst()
             const turbulenceAmount = weatherDensity
               .dot(remapClamp(heightFraction, vec4(0.3), vec4(0)))
-              .mul(highFrequencyWeight)
-              .mul(edgeFade)
               .toConst()
             const turbulence = vec3(0).toVar()
 
             If(
-              clouds.turbulenceNode.and(highFrequencyWeight.greaterThan(EPSILON)),
+              clouds.turbulenceNode.and(hasRoughDensity),
               () => {
                 turbulence.assign(
                   this.turbulenceTextureNode
@@ -1472,52 +1679,53 @@ export class CloudsShadowNode extends TempNode {
                     )
                     .rgb.mul(2)
                     .sub(1)
-                    .mul(clouds.turbulenceDisplacementNode.mul(turbulenceAmount))
+                    .mul(
+                      clouds.turbulenceDisplacementNode.mul(turbulenceAmount)
+                    )
                 )
               }
             )
 
-            const shape = this.shapeTextureNode
-              .sample(
+            If(hasRoughDensity, () => {
+              const shapeMipLevel = min(
+                mipLevel,
+                this.shapeTextureMipLevelMaxNode
+              ).toConst()
+              const shape = textureLevel(
+                this.shapeTextureNode,
                 positionWorld
                   .add(evolution)
                   .add(turbulence)
                   .mul(clouds.shapeRepeatNode)
-                  .add(clouds.shapeOffsetNode)
-              )
-              .r.toConst()
-            const density = remapClamp(
-              weatherDensity,
-              vec4(1).sub(shape).mul(clouds.shapeAmountsNode),
-              vec4(1)
-            ).toVar()
-            const densityMean = density.x
-              .add(density.y)
-              .add(density.z)
-              .add(density.w)
-              .mul(0.25)
-              .toConst()
-            const densityEdgeFade = remapClamp(
-              densityMean,
-              float(0.04),
-              float(0.18)
-            ).toConst()
-            const detailFade = highFrequencyWeight
-              .mul(densityEdgeFade.pow2())
-              .mul(float(1).sub(remapClamp(mipLevel, float(0.1), float(0.85))))
-              .toConst()
-            const shapeDetailPosition = positionWorld
-              .add(turbulence)
-              .mul(clouds.shapeDetailRepeatNode)
-              .add(clouds.shapeDetailOffsetNode)
-              .toConst()
-            const detail = this.shapeDetailTextureNode
-              .sample(shapeDetailPosition)
-              .r.toConst()
+                  .add(clouds.shapeOffsetNode),
+                shapeMipLevel
+              ).r.toConst()
+              const density = remapClamp(
+                weatherDensity,
+                vec4(1).sub(shape).mul(clouds.shapeAmountsNode),
+                vec4(1)
+              ).toVar()
+              const shapeDetailPosition = positionWorld
+                .add(turbulence)
+                .mul(clouds.shapeDetailRepeatNode)
+                .add(clouds.shapeDetailOffsetNode)
+                .toConst()
+              const shapeDetailMipLevel = min(
+                mipLevel,
+                this.shapeDetailTextureMipLevelMaxNode
+              ).toConst()
+              const detail = textureLevel(
+                this.shapeDetailTextureNode,
+                shapeDetailPosition,
+                shapeDetailMipLevel
+              ).r.toConst()
+              const detailEnabled = mipLevel
+                .mul(0.5)
+                .add(jitter.sub(0.5).mul(0.5))
+                .lessThan(0.5)
+                .toConst()
 
-            If(
-              clouds.shapeDetailNode.and(detailFade.greaterThan(EPSILON)),
-              () => {
+              If(clouds.shapeDetailNode.and(detailEnabled), () => {
                 const modifier = mix(
                   vec4(detail.pow(6)),
                   vec4(1).sub(detail),
@@ -1530,37 +1738,45 @@ export class CloudsShadowNode extends TempNode {
                   modifier.mul(0.5),
                   vec4(1)
                 ).toConst()
-                density.assign(mix(density, detailedDensity, detailFade))
-              }
-            )
+                density.assign(detailedDensity)
+              })
 
-            density.assign(
-              density
-                .mul(clouds.densityScalesNode)
-                .mul(
-                  clouds.densityProfileExpTermsNode
-                    .mul(exp(clouds.densityProfileExponentsNode.mul(heightFraction)))
-                    .add(clouds.densityProfileLinearTermsNode.mul(heightFraction))
-                    .add(clouds.densityProfileConstantTermsNode)
-                )
-                .saturate()
-            )
-            const densitySum = density.x
-              .add(density.y)
-              .add(density.z)
-              .add(density.w)
-              .toConst()
-
-            If(densitySum.greaterThan(this.minDensityNode), () => {
-              extinction.assign(
-                densitySum
+              density.assign(
+                density
+                  .mul(clouds.densityScalesNode)
                   .mul(
-                    clouds.scatteringCoefficientNode.add(
-                      clouds.absorptionCoefficientNode
-                    )
+                    clouds.densityProfileExpTermsNode
+                      .mul(
+                        exp(
+                          clouds.densityProfileExponentsNode.mul(
+                            heightFraction
+                          )
+                        )
+                      )
+                      .add(
+                        clouds.densityProfileLinearTermsNode.mul(heightFraction)
+                      )
+                      .add(clouds.densityProfileConstantTermsNode)
                   )
-                  .max(this.minExtinctionNode)
+                  .saturate()
               )
+              const densitySum = density.x
+                .add(density.y)
+                .add(density.z)
+                .add(density.w)
+                .toConst()
+
+              If(densitySum.greaterThan(this.minDensityNode), () => {
+                extinction.assign(
+                  densitySum
+                    .mul(
+                      clouds.scatteringCoefficientNode.add(
+                        clouds.absorptionCoefficientNode
+                      )
+                    )
+                    .max(this.minExtinctionNode)
+                )
+              })
             })
           }
         )
@@ -1570,7 +1786,18 @@ export class CloudsShadowNode extends TempNode {
     )
 
     const fragmentNode = Fn(() => {
-      const clip = uv().mul(2).sub(1).toConst()
+      const localUv = vec2(
+        screenCoordinate.x
+          .sub(
+            this.currentShadowCascadeIndexNode
+              .toFloat()
+              .mul(this.shadowTileSizeNode.x)
+          )
+          .add(0.5)
+          .mul(this.shadowTileTexelSizeNode.x),
+        screenCoordinate.y.add(0.5).mul(this.shadowTileTexelSizeNode.y)
+      ).toConst()
+      const clip = localUv.mul(2).sub(1).toConst()
       const pointWorld = this.currentInverseShadowMatrixNode
         .mul(vec4(clip, -1, 1))
         .toVar()
@@ -1595,7 +1822,12 @@ export class CloudsShadowNode extends TempNode {
         rayOriginUnit,
         rayDirectionUnit,
         vec3(0),
-        vec4(maxRadius, minRadius, atmosphere.bottomRadius, atmosphere.bottomRadius)
+        vec4(
+          maxRadius,
+          minRadius,
+          atmosphere.bottomRadius,
+          atmosphere.bottomRadius
+        )
       )
         .get('near')
         .toConst()
@@ -1616,83 +1848,109 @@ export class CloudsShadowNode extends TempNode {
 
       If(segmentEnd.greaterThan(segmentStart), () => {
         const jitter = float(0.5).toConst()
-        const segmentLengthWorld = segmentEnd.sub(segmentStart).mul(unitToWorld).toConst()
-        const stepSizeWorld = segmentLengthWorld
+        const rayStartUnit = rayOriginUnit
+          .add(rayDirectionUnit.mul(segmentStart))
+          .toConst()
+        const segmentLengthWorld = segmentEnd
+          .sub(segmentStart)
+          .mul(unitToWorld)
+          .toConst()
+        const samplePeriodWorld = segmentLengthWorld
           .div(this.maxIterationCountNode.toFloat().max(1))
           .clamp(this.minStepSizeNode, this.maxStepSizeNode)
           .toConst()
-        const rayDistance = segmentStart
-          .add(stepSizeWorld.mul(atmosphere.worldToUnit).mul(jitter))
+        const structureNormal = getCloudShadowStructureNormal(
+          rayDirectionUnit,
+          jitter
+        ).toConst()
+        const normalDotRay = dot(rayDirectionUnit, structureNormal).toConst()
+        const safeNormalDotRay = select(
+          normalDotRay.abs().lessThan(EPSILON),
+          select(
+            normalDotRay.greaterThanEqual(0),
+            float(EPSILON),
+            float(-EPSILON)
+          ),
+          normalDotRay
+        ).toConst()
+        const stepSizeWorld = samplePeriodWorld
+          .div(safeNormalDotRay.abs())
+          .toConst()
+        const rayStartWorld = rayStartUnit.mul(unitToWorld).toConst()
+        const rayDistanceWorld = dot(rayStartWorld, structureNormal)
+          .mod(samplePeriodWorld)
+          .negate()
+          .div(safeNormalDotRay)
           .toVar()
 
-        Loop({ start: 0, end: WEBGPU_MAX_PRIMARY_STEPS, condition: '<' }, ({ i }) => {
-          If(float(i).greaterThanEqual(this.maxIterationCountNode.toFloat()), () => {
-            Break()
-          })
-          If(rayDistance.greaterThanEqual(segmentEnd), () => {
-            Break()
-          })
-
-          const positionUnit = rayOriginUnit
-            .add(rayDirectionUnit.mul(rayDistance))
-            .toConst()
-          const rayDistanceWorld = rayDistance
-            .sub(segmentStart)
-            .mul(unitToWorld)
-            .toConst()
-          const highFrequencyWeight = float(1)
-            .sub(
-              remapClamp(
-                rayDistanceWorld,
-                float(HIGH_FREQUENCY_FADE_START),
-                float(HIGH_FREQUENCY_FADE_END)
-              )
-            )
-            .toConst()
-          const extinction = sampleExtinctionAt(
-            positionUnit,
-            this.currentShadowMipLevelNode,
-            highFrequencyWeight
-          ).toConst()
-
-          If(extinction.greaterThan(this.minExtinctionNode), () => {
-            const sampleTransmittance = exp(
-              extinction.negate().mul(stepSizeWorld)
-            ).toConst()
-            extinctionSum.addAssign(extinction)
-            maxOpticalDepth.addAssign(extinction.mul(stepSizeWorld))
-            transmittanceIntegral.mulAssign(sampleTransmittance)
-            weightedDistanceSum.addAssign(
-              rayDistanceWorld.mul(transmittanceIntegral)
-            )
-            transmittanceSum.addAssign(transmittanceIntegral)
-            sampleCount.addAssign(1)
-
-            If(
-              transmittanceIntegral.lessThanEqual(this.minTransmittanceNode),
-              () => {
-                maxOpticalDepthTail.assign(
-                  min(
-                    this.opticalDepthTailScaleNode
-                      .mul(stepSizeWorld)
-                      .mul(exp(sampleCount.oneMinus())),
-                    stepSizeWorld.mul(0.5)
-                  )
-                )
-              }
-            )
-
-            If(
-              transmittanceIntegral.lessThanEqual(this.minTransmittanceNode),
-              () => {
-              Break()
-              }
-            )
-          })
-
-          rayDistance.addAssign(stepSizeWorld.mul(atmosphere.worldToUnit))
-          Continue()
+        If(rayDistanceWorld.lessThan(0), () => {
+          rayDistanceWorld.addAssign(stepSizeWorld)
         })
+        rayDistanceWorld.subAssign(stepSizeWorld.mul(jitter))
+
+        Loop(
+          { start: 0, end: WEBGPU_MAX_PRIMARY_STEPS, condition: '<' },
+          ({ i }) => {
+            If(
+              float(i).greaterThanEqual(this.maxIterationCountNode.toFloat()),
+              () => {
+                Break()
+              }
+            )
+            If(rayDistanceWorld.greaterThan(segmentLengthWorld), () => {
+              Break()
+            })
+
+            const positionUnit = rayStartUnit
+              .add(
+                rayDirectionUnit.mul(rayDistanceWorld.mul(atmosphere.worldToUnit))
+              )
+              .toConst()
+            const extinction = sampleExtinctionAt(
+              positionUnit,
+              this.currentShadowMipLevelNode,
+              jitter
+            ).toConst()
+
+            If(extinction.greaterThan(this.minExtinctionNode), () => {
+              const sampleTransmittance = exp(
+                extinction.negate().mul(stepSizeWorld)
+              ).toConst()
+              extinctionSum.addAssign(extinction)
+              maxOpticalDepth.addAssign(extinction.mul(stepSizeWorld))
+              transmittanceIntegral.mulAssign(sampleTransmittance)
+              weightedDistanceSum.addAssign(
+                rayDistanceWorld.mul(transmittanceIntegral)
+              )
+              transmittanceSum.addAssign(transmittanceIntegral)
+              sampleCount.addAssign(1)
+
+              If(
+                transmittanceIntegral.lessThanEqual(this.minTransmittanceNode),
+                () => {
+                  maxOpticalDepthTail.assign(
+                    min(
+                      this.opticalDepthTailScaleNode
+                        .mul(stepSizeWorld)
+                        .mul(exp(sampleCount.oneMinus())),
+                      stepSizeWorld.mul(0.5)
+                    )
+                  )
+                }
+              )
+
+              If(
+                transmittanceIntegral.lessThanEqual(this.minTransmittanceNode),
+                () => {
+                  Break()
+                }
+              )
+            })
+
+            rayDistanceWorld.addAssign(stepSizeWorld)
+            Continue()
+          }
+        )
       })
 
       const shadowData = select(
@@ -1718,12 +1976,13 @@ export class CloudsShadowNode extends TempNode {
       const frontPositionWorld = atmosphere.matrixECEFToWorld
         .mul(
           vec4(
-            frontPositionUnit.sub(altitudeCorrectionUnit).div(atmosphere.worldToUnit),
+            frontPositionUnit
+              .sub(altitudeCorrectionUnit)
+              .div(atmosphere.worldToUnit),
             1
           )
         )
-        .xyz
-        .toConst()
+        .xyz.toConst()
       const prevClip = this.currentReprojectionMatrixNode
         .mul(vec4(frontPositionWorld, 1))
         .toConst()
@@ -1732,7 +1991,10 @@ export class CloudsShadowNode extends TempNode {
         .mul(0.5)
         .add(0.5)
         .toConst()
-      const shadowVelocity = uv().sub(prevLocalUv).mul(this.shadowTileSizeNode).toConst()
+      const shadowVelocity = localUv
+        .sub(prevLocalUv)
+        .mul(this.shadowTileSizeNode)
+        .toConst()
 
       return mrt({
         shadow: shadowData,

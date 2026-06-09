@@ -160,6 +160,10 @@ export class CloudsContext {
   private _qualityPreset: QualityPreset = 'high'
   private _resolutionScale = webgpuQualityPresets.high.resolutionScale
   private _temporalUpscaleScale = 0.375
+  private _discardAllHistory = false
+  private _velocityThresholdPixels = 6
+  private _historyResetDistanceThreshold = 100
+  private _temporalAlpha: number | null = null
   private _lightShafts = webgpuQualityPresets.high.lightShafts
   private _shapeDetail = webgpuQualityPresets.high.shapeDetail
   private _turbulence = webgpuQualityPresets.high.turbulence
@@ -324,6 +328,12 @@ export class CloudsContext {
   readonly maxLayerHeightsNode = uniform(
     this.layerState.maxLayerHeights.value
   ).setName('cloudsMaxLayerHeights')
+  readonly minIntervalHeightsNode = uniform(
+    this.layerState.minIntervalHeights.value
+  ).setName('cloudsMinIntervalHeights')
+  readonly maxIntervalHeightsNode = uniform(
+    this.layerState.maxIntervalHeights.value
+  ).setName('cloudsMaxIntervalHeights')
   readonly densityScalesNode = uniform(
     this.layerState.densityScales.value
   ).setName('cloudsDensityScales')
@@ -470,6 +480,57 @@ export class CloudsContext {
       return
     }
     this._temporalUpscaleScale = next
+    this.invalidateHistory()
+  }
+
+  get discardAllHistory(): boolean {
+    return this._discardAllHistory
+  }
+
+  set discardAllHistory(value: boolean) {
+    if (this._discardAllHistory === value) {
+      return
+    }
+    this._discardAllHistory = value
+    this.invalidateHistory()
+  }
+
+  get velocityThresholdPixels(): number {
+    return this._velocityThresholdPixels
+  }
+
+  set velocityThresholdPixels(value: number) {
+    const next = Math.max(value, 0)
+    if (this._velocityThresholdPixels === next) {
+      return
+    }
+    this._velocityThresholdPixels = next
+    this.invalidateHistory()
+  }
+
+  get historyResetDistanceThreshold(): number {
+    return this._historyResetDistanceThreshold
+  }
+
+  set historyResetDistanceThreshold(value: number) {
+    const next = Math.max(value, 0)
+    if (this._historyResetDistanceThreshold === next) {
+      return
+    }
+    this._historyResetDistanceThreshold = next
+    this.invalidateHistory()
+  }
+
+  get temporalAlpha(): number | null {
+    return this._temporalAlpha
+  }
+
+  set temporalAlpha(value: number | null) {
+    const next = value == null ? null : Math.min(Math.max(value, 0), 1)
+    if (this._temporalAlpha === next) {
+      return
+    }
+    this._temporalAlpha = next
     this.invalidateHistory()
   }
 

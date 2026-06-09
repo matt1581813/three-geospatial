@@ -37,7 +37,8 @@ type AerialPerspectiveNodeScope = typeof CAMERA | typeof BACKDROP
 
 type CloudShadowSampleFn = (
   positionWorldNode: Node<'vec3'>,
-  normalWorldNode?: Node<'vec3'> | null
+  normalWorldNode?: Node<'vec3'> | null,
+  distancePositionUnitNode?: Node<'vec3'> | null
 ) => Node<'float'>
 
 export interface CloudsAerialProviders {
@@ -52,7 +53,14 @@ function resolveCloudShadowSample(provider: unknown): CloudShadowSampleFn | null
   if (
     typeof (provider as { sample?: unknown }).sample === 'function'
   ) {
-    return (provider as { sample: CloudShadowSampleFn }).sample
+    const sample = (provider as { sample: CloudShadowSampleFn }).sample.bind(
+      provider
+    )
+    return (
+      positionWorldNode,
+      normalWorldNode = null,
+      distancePositionUnitNode = null
+    ) => sample(positionWorldNode, normalWorldNode, distancePositionUnitNode)
   }
   return null
 }
@@ -261,7 +269,8 @@ export class AerialPerspectiveNode extends TempNode {
         skyNode.rayDirectionECEF = rayDirectionECEF
       }
 
-      const positionUnit = getSurfacePositionUnit().toVar()
+      const rawPositionUnit = getSurfacePositionUnit().toConst()
+      const positionUnit = rawPositionUnit.toVar()
 
       // Changed our strategy on the geometric error correction, because we no
       // longer have LightingMask to exclude objects in space.
@@ -328,16 +337,16 @@ export class AerialPerspectiveNode extends TempNode {
         let solarDirectIlluminance = solarIlluminance.get('direct')
         if (sampleCloudShadow != null) {
           const positionWorld = atmosphereContext.matrixECEFToWorld
-            .mul(
-              vec4(
-                positionUnit.sub(altitudeCorrectionUnit).div(worldToUnit),
-                1
-              )
-            )
+            .mul(vec4(rawPositionUnit.div(worldToUnit), 1))
             .xyz
+            .toConst()
+          const distancePositionUnit = positionUnit
+            .add(altitudeCorrectionUnit)
+            .toConst()
           const cloudShadow = sampleCloudShadow(
             positionWorld,
-            normalWorld
+            null,
+            distancePositionUnit
           ).clamp(0, 1)
           solarDirectIlluminance = solarDirectIlluminance.mul(cloudShadow)
         }

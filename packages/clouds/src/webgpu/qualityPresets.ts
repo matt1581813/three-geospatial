@@ -1,7 +1,7 @@
 import type { QualityPreset } from '../qualityPresets'
 import type { FrustumSplitMode } from '../helpers/splitFrustum'
 
-export const WEBGPU_MAX_PRIMARY_STEPS = 256
+export const WEBGPU_MAX_PRIMARY_STEPS = 500
 export const WEBGPU_MAX_SECONDARY_STEPS = 8
 
 export interface WebGPUCloudsQualityPreset {

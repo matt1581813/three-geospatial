@@ -59,9 +59,9 @@ import {
 
 import {
   getAtmosphereContext,
-  getSkyLuminanceToPoint,
-  getSunAndSkyIlluminance,
-  getSunAndSkyScalarIlluminance
+  getIndirectLuminanceToPoint,
+  getSplitIlluminance,
+  getSplitScalarIlluminance
 } from '@takram/three-atmosphere/webgpu'
 import {
   cameraFar,
@@ -72,8 +72,8 @@ import {
   inverseViewMatrix,
   raySphereIntersection,
   screenToPositionView,
-  TemporalAntialiasNode,
   temporalAntialias,
+  TemporalAntialiasNode,
   type Node
 } from '@takram/three-geospatial/webgpu'
 
@@ -87,8 +87,8 @@ import {
   getCloudsContext
 } from './CloudsContext'
 import { CloudsRenderTargets } from './CloudsRenderTargets'
-import { CloudsShadowNode } from './CloudsShadowNode'
 import { CloudsShadowLengthNode } from './CloudsShadowLengthNode'
+import { CloudsShadowNode } from './CloudsShadowNode'
 import { CloudsTemporalState } from './CloudsTemporalState'
 import {
   WEBGPU_MAX_PRIMARY_STEPS,
@@ -100,10 +100,8 @@ const { resetRendererState, restoreRendererState } = RendererUtils
 const MULTI_SCATTERING_OCTAVES = 8
 const EPSILON = 1e-6
 const WEBGPU_MAX_SHADOW_LENGTH_STEPS = 512
-const HIGH_FREQUENCY_FADE_START = 20_000
-const HIGH_FREQUENCY_FADE_END = 120_000
-const SHAPE_DETAIL_FADE_FLOOR = 0.02
 const RECIPROCAL_PI4 = 1 / (4 * Math.PI)
+const MIPMAP_FILTER_MIN = 1004
 export const CLOUDS_TEMPORAL_ALPHA = 0.05
 export const CLOUDS_VARIANCE_GAMMA = 1.0
 export const CLOUDS_VELOCITY_THRESHOLD = 0.1
@@ -154,6 +152,32 @@ export function updateStbnSamplingParameters(
   scale.set(1 / width, 1 / height, 1 / depth)
   const layer = layerOverride ?? frameId
   return ((layer % depth) + depth) % depth
+}
+
+function supportsMipmappedSampling(texture: Texture): boolean {
+  if ((texture.mipmaps?.length ?? 0) > 0) {
+    return true
+  }
+  return texture.generateMipmaps || texture.minFilter >= MIPMAP_FILTER_MIN
+}
+
+function getTextureMaxMipLevel(texture: Texture): number {
+  if (!supportsMipmappedSampling(texture)) {
+    return 0
+  }
+
+  const image = (texture.source?.data ?? texture.image) as
+    | {
+        width?: number
+        height?: number
+        depth?: number
+      }
+    | undefined
+  const width = Math.max(Math.floor(image?.width ?? 1), 1)
+  const height = Math.max(Math.floor(image?.height ?? 1), 1)
+  const depth = Math.max(Math.floor(image?.depth ?? 1), 1)
+  const maxDimension = Math.max(width, height, depth)
+  return Math.max(0, Math.floor(Math.log2(maxDimension)))
 }
 
 export function mapScreenCoordinateToLowResCoordinate(
@@ -283,7 +307,10 @@ type CloudsMarchRenderTextureName =
   | 'velocity'
   | 'cloudDepth'
 type CloudsResolvedTextureName = 'output' | 'velocity' | 'mask' | 'depth'
-export type CloudsTextureName = Exclude<CloudsMarchRenderTextureName, 'effectColor'>
+export type CloudsTextureName = Exclude<
+  CloudsMarchRenderTextureName,
+  'effectColor'
+>
 type CloudsTemporalResolveOwner = {
   projectionMatrix?: Matrix4 | null
 }
@@ -357,13 +384,16 @@ export class CloudsNode extends TempNode {
   camera: Camera
   projectionMatrix?: Matrix4 | null
 
-  private readonly marchRenderTargets = new CloudsRenderTargets<CloudsMarchRenderTextureName>(
-    this,
-    {
-      colorAttachments: ['output', 'effectColor', 'transmittanceDepth', 'velocity'],
+  private readonly marchRenderTargets =
+    new CloudsRenderTargets<CloudsMarchRenderTextureName>(this, {
+      colorAttachments: [
+        'output',
+        'effectColor',
+        'transmittanceDepth',
+        'velocity'
+      ],
       depthAttachment: 'cloudDepth'
-    }
-  )
+    })
   private readonly resolvedRenderTargets =
     new CloudsRenderTargets<CloudsResolvedTextureName>(null, {
       colorAttachments: ['output', 'velocity', 'mask'],
@@ -375,7 +405,9 @@ export class CloudsNode extends TempNode {
   private readonly resolveMesh = new QuadMesh(this.resolveMaterial)
   private readonly localWeatherNode = texture(fallbackLocalWeatherTexture)
   private readonly shapeTextureNode = texture3D(fallbackShapeTexture)
-  private readonly shapeDetailTextureNode = texture3D(fallbackShapeDetailTexture)
+  private readonly shapeDetailTextureNode = texture3D(
+    fallbackShapeDetailTexture
+  )
   private readonly turbulenceTextureNode = texture(fallbackTurbulenceTexture)
   private readonly stbnTextureNode = texture3D(fallbackStbnTexture)
   private readonly stbnScaleNode = uniform(new Vector3()).setName(
@@ -385,15 +417,21 @@ export class CloudsNode extends TempNode {
   private readonly resolveFrameIndexNode = uniform(0).setName(
     'cloudsResolveFrameIndex'
   )
-  private readonly mipLevelScale = uniform(0.1)
+  private readonly mipLevelScale = uniform(1)
+  private readonly shapeTextureMipLevelMaxNode = uniform(0).setName(
+    'cloudsShapeTextureMipLevelMax'
+  )
+  private readonly shapeDetailTextureMipLevelMaxNode = uniform(0).setName(
+    'cloudsShapeDetailTextureMipLevelMax'
+  )
   private readonly currentBaseProjectionMatrix = new Matrix4()
   private readonly previousBaseProjectionMatrix = new Matrix4()
   private readonly currentProjectionMatrixNode = uniform(new Matrix4()).setName(
     'cloudsCurrentProjectionMatrix'
   )
-  private readonly previousProjectionMatrixNode = uniform(new Matrix4()).setName(
-    'cloudsPreviousProjectionMatrix'
-  )
+  private readonly previousProjectionMatrixNode = uniform(
+    new Matrix4()
+  ).setName('cloudsPreviousProjectionMatrix')
   private readonly currentInverseProjectionMatrixNode = uniform(
     new Matrix4()
   ).setName('cloudsCurrentInverseProjectionMatrix')
@@ -417,6 +455,7 @@ export class CloudsNode extends TempNode {
   private animatedStbnFrame = 0
   private previousFrameValid = false
   private cameraPoseValid = false
+  private temporalResolveBaseAlpha = 0.1
   private readonly previousCameraPosition = new Vector3()
   private readonly previousCameraQuaternion = new Quaternion()
 
@@ -459,6 +498,12 @@ export class CloudsNode extends TempNode {
     this.shapeTextureNode.value = context.resolvedShapeTexture
     this.shapeDetailTextureNode.value = context.resolvedShapeDetailTexture
     this.turbulenceTextureNode.value = context.resolvedTurbulenceTexture
+    this.shapeTextureMipLevelMaxNode.value = getTextureMaxMipLevel(
+      context.resolvedShapeTexture
+    )
+    this.shapeDetailTextureMipLevelMaxNode.value = getTextureMaxMipLevel(
+      context.resolvedShapeDetailTexture
+    )
     this.stbnTextureNode.value = context.resolvedStbnTexture
     this.stbnLayerNode.value = updateStbnSamplingParameters(
       context.resolvedStbnTexture,
@@ -476,8 +521,12 @@ export class CloudsNode extends TempNode {
       height
     )
     let resolveResized = false
+    let resolvedWidth = width
+    let resolvedHeight = height
     if (this.temporalUpscaleEnabled) {
       const resolveSize = this.getResolvedRenderSize(renderer)
+      resolvedWidth = resolveSize.width
+      resolvedHeight = resolveSize.height
       resolveResized = this.setRenderTargetSize(
         this.resolvedRenderTargets,
         resolveSize.width,
@@ -488,7 +537,8 @@ export class CloudsNode extends TempNode {
       this.consumeHistoryReset() ||
       marchResized ||
       resolveResized ||
-      this.detectCameraCut()
+      this.detectCameraCut() ||
+      this.detectLargeLocalDisplacement(context.historyResetDistanceThreshold)
     if (historyResetRequested) {
       this.temporalFrameIndex = 0
     }
@@ -496,6 +546,18 @@ export class CloudsNode extends TempNode {
     this.cacheCameraPose()
     if (historyResetRequested) {
       this.temporalResolveNode?.invalidateHistory()
+    }
+    if (this.temporalResolveNode != null) {
+      const temporalAlpha = context.discardAllHistory
+        ? 1
+        : (context.temporalAlpha ?? this.temporalResolveBaseAlpha)
+      this.temporalResolveNode.temporalAlpha.value = temporalAlpha
+      const thresholdDivisor = Math.max(
+        Math.min(resolvedWidth, resolvedHeight),
+        1
+      )
+      this.temporalResolveNode.velocityThreshold.value =
+        context.velocityThresholdPixels / thresholdDivisor
     }
 
     this.rendererState = resetRendererState(renderer, this.rendererState)
@@ -540,7 +602,8 @@ export class CloudsNode extends TempNode {
         : null
     if (cloudsShadowLengthSource instanceof CloudsShadowLengthNode) {
       cloudsShadowLengthSource.setContexts(cloudsContext, atmosphereContext)
-      this.cloudsShadowLengthNode = cloudsShadowLengthSource.sampleShadowLength()
+      this.cloudsShadowLengthNode =
+        cloudsShadowLengthSource.sampleShadowLength()
     } else if (
       cloudsShadowLengthSource != null &&
       typeof (
@@ -599,11 +662,12 @@ export class CloudsNode extends TempNode {
         {
           temporalAlpha: 0.03,
           varianceGamma: 4,
-          allowBackgroundHistory: true,
-          disableDepthRejection: true,
-          disableVelocityRejection: true
+          allowBackgroundHistory: false,
+          disableDepthRejection: false,
+          disableVelocityRejection: false
         }
       )
+      this.temporalResolveBaseAlpha = 0.03
       return this.temporalResolveNode
     }
 
@@ -628,13 +692,14 @@ export class CloudsNode extends TempNode {
       this.camera,
       null,
       {
-        temporalAlpha: 0.1,
+        temporalAlpha: 0.14,
         varianceGamma: 2,
-        allowBackgroundHistory: true,
-        disableDepthRejection: true,
-        disableVelocityRejection: true
+        allowBackgroundHistory: false,
+        disableDepthRejection: false,
+        disableVelocityRejection: false
       }
     )
+    this.temporalResolveBaseAlpha = 0.14
     return this.temporalResolveNode
   }
 
@@ -689,6 +754,19 @@ export class CloudsNode extends TempNode {
     )
   }
 
+  private detectLargeLocalDisplacement(threshold: number): boolean {
+    if (!this.cameraPoseValid) {
+      return false
+    }
+
+    cameraPositionScratch.setFromMatrixPosition(this.camera.matrixWorld)
+
+    const positionDelta = cameraPositionScratch.distanceTo(
+      this.previousCameraPosition
+    )
+    return positionDelta > threshold
+  }
+
   private cacheCameraPose(): void {
     this.previousCameraPosition.setFromMatrixPosition(this.camera.matrixWorld)
     this.previousCameraQuaternion.setFromRotationMatrix(this.camera.matrixWorld)
@@ -714,9 +792,10 @@ export class CloudsNode extends TempNode {
     }
   }
 
-  private getResolvedRenderSize(
-    renderer: NonNullable<NodeFrame['renderer']>
-  ): { width: number; height: number } {
+  private getResolvedRenderSize(renderer: NonNullable<NodeFrame['renderer']>): {
+    width: number
+    height: number
+  } {
     const size = renderer.getDrawingBufferSize(sizeScratch)
     return {
       width: Math.max(Math.round(size.x), 1),
@@ -741,7 +820,8 @@ export class CloudsNode extends TempNode {
     resetHistory: boolean,
     context: CloudsContext
   ): void {
-    const projectionMatrix = this.projectionMatrix ?? this.camera.projectionMatrix
+    const projectionMatrix =
+      this.projectionMatrix ?? this.camera.projectionMatrix
 
     if (!this.previousFrameValid || resetHistory) {
       this.previousBaseProjectionMatrix.copy(projectionMatrix)
@@ -753,11 +833,15 @@ export class CloudsNode extends TempNode {
     }
 
     this.currentBaseProjectionMatrix.copy(projectionMatrix)
-    this.currentProjectionMatrixNode.value.copy(this.currentBaseProjectionMatrix)
-    this.previousProjectionMatrixNode.value.copy(this.previousBaseProjectionMatrix)
+    this.currentProjectionMatrixNode.value.copy(
+      this.currentBaseProjectionMatrix
+    )
+    this.previousProjectionMatrixNode.value.copy(
+      this.previousBaseProjectionMatrix
+    )
 
     if (this.temporalUpscaleEnabled) {
-      this.mipLevelScale.value = context.temporalUpscaleScale
+      this.mipLevelScale.value = 0.25
     } else {
       this.mipLevelScale.value = 1
     }
@@ -833,14 +917,21 @@ export class CloudsNode extends TempNode {
         nearestColor,
         smoothWeight
       ).toConst()
-      const reconstructedVelocity = velocityTextureNode.load(closestCoord).xyz.toConst()
+      const reconstructedVelocityNdc = velocityTextureNode
+        .load(closestCoord)
+        .xyz.toConst()
+      const reconstructedVelocityUv = vec3(
+        reconstructedVelocityNdc.x.mul(0.5),
+        reconstructedVelocityNdc.y.mul(-0.5),
+        reconstructedVelocityNdc.z
+      ).toConst()
       const currentFrameMask = getBayerIndex(closestCoord)
         .equal(this.resolveFrameIndexNode)
         .toFloat()
 
       return mrt({
         output: reconstructedColor,
-        velocity: vec4(reconstructedVelocity, 1),
+        velocity: vec4(reconstructedVelocityUv, 1),
         mask: vec4(currentFrameMask)
       })
     })()
@@ -861,9 +952,8 @@ export class CloudsNode extends TempNode {
     const perspective = this.camera.isPerspectiveCamera
     const logarithmic = builder.renderer.logarithmicDepthBuffer
     const sampleExtinctionAt = Fn(
-      ([positionUnit, mipLevel, jitter, highFrequencyWeight]: [
+      ([positionUnit, mipLevel, jitter]: [
         Node<'vec3'>,
-        Node<'float'>,
         Node<'float'>,
         Node<'float'>
       ]) => {
@@ -890,19 +980,53 @@ export class CloudsNode extends TempNode {
               weatherCoord,
               mipLevel
             ).rgba.toConst()
+            const layerHeightSpan = clouds.maxLayerHeightsNode
+              .sub(clouds.minLayerHeightsNode)
+              .toConst()
+            const activeLayerMask = vec4(
+              layerHeightSpan.x.greaterThan(float(EPSILON)).toFloat(),
+              layerHeightSpan.y.greaterThan(float(EPSILON)).toFloat(),
+              layerHeightSpan.z.greaterThan(float(EPSILON)).toFloat(),
+              layerHeightSpan.w.greaterThan(float(EPSILON)).toFloat()
+            ).toConst()
+            const safeMaxLayerHeights = vec4(
+              mix(
+                clouds.minLayerHeightsNode.x.add(1),
+                clouds.maxLayerHeightsNode.x,
+                activeLayerMask.x
+              ),
+              mix(
+                clouds.minLayerHeightsNode.y.add(1),
+                clouds.maxLayerHeightsNode.y,
+                activeLayerMask.y
+              ),
+              mix(
+                clouds.minLayerHeightsNode.z.add(1),
+                clouds.maxLayerHeightsNode.z,
+                activeLayerMask.z
+              ),
+              mix(
+                clouds.minLayerHeightsNode.w.add(1),
+                clouds.maxLayerHeightsNode.w,
+                activeLayerMask.w
+              )
+            ).toConst()
             const mappedWeather = vec4(
               dot(localWeather, clouds.localWeatherChannelMask0Node),
               dot(localWeather, clouds.localWeatherChannelMask1Node),
               dot(localWeather, clouds.localWeatherChannelMask2Node),
               dot(localWeather, clouds.localWeatherChannelMask3Node)
             )
+              .mul(activeLayerMask)
               .pow(clouds.weatherExponentsNode)
               .toVar()
             const heightFraction = remapClamp(
               vec4(height),
               clouds.minLayerHeightsNode,
-              clouds.maxLayerHeightsNode
-            ).toConst()
+              safeMaxLayerHeights
+            )
+              .mul(activeLayerMask)
+              .toConst()
             const biased = heightFraction
               .pow(clouds.shapeAlteringBiasesNode)
               .mul(2)
@@ -917,18 +1041,9 @@ export class CloudsNode extends TempNode {
               mix(mappedWeather, vec4(1), clouds.coverageFilterWidthsNode),
               coverageFactor,
               coverageFactor.add(clouds.coverageFilterWidthsNode)
-            ).toVar()
-            const weatherDensityMean = weatherDensity.x
-              .add(weatherDensity.y)
-              .add(weatherDensity.z)
-              .add(weatherDensity.w)
-              .mul(0.25)
-              .toConst()
-            const edgeFade = remapClamp(
-              weatherDensityMean,
-              float(0.05),
-              float(0.22)
-            ).toConst()
+            )
+              .mul(activeLayerMask)
+              .toVar()
             const positionWorld = positionUnit.mul(unitToWorld).toConst()
             const localWeatherSpeed = clouds.localWeatherOffsetNode
               .length()
@@ -941,91 +1056,67 @@ export class CloudsNode extends TempNode {
               .toConst()
             const turbulenceAmount = weatherDensity
               .dot(remapClamp(heightFraction, vec4(0.3), vec4(0)))
-              .mul(highFrequencyWeight)
-              .mul(edgeFade)
               .toConst()
             const turbulence = vec3(0).toVar()
-            If(
-              clouds.turbulenceNode.and(
-                highFrequencyWeight.greaterThan(EPSILON)
-              ),
-              () => {
-                turbulence.assign(
-                  this.turbulenceTextureNode
-                    .sample(
-                      weatherUv
-                        .mul(clouds.localWeatherRepeatNode)
-                        .mul(clouds.turbulenceRepeatNode)
-                    )
-                    .rgb.mul(2)
-                    .sub(1)
-                    .mul(
-                      clouds.turbulenceDisplacementNode.mul(turbulenceAmount)
-                    )
-                )
-              }
-            )
-            const shape = this.shapeTextureNode
-              .sample(
-                positionWorld
-                  .add(evolution)
-                  .add(turbulence)
-                  .mul(clouds.shapeRepeatNode)
-                  .add(clouds.shapeOffsetNode)
+            If(clouds.turbulenceNode, () => {
+              turbulence.assign(
+                // Match the WebGL main march: local weather uses explicit LOD,
+                // while turbulence/shape/detail keep implicit texture LOD so
+                // high-altitude views do not smear cloud structure away.
+                this.turbulenceTextureNode
+                  .sample(
+                    weatherUv
+                      .mul(clouds.localWeatherRepeatNode)
+                      .mul(clouds.turbulenceRepeatNode)
+                  )
+                  .rgb.mul(2)
+                  .sub(1)
+                  .mul(clouds.turbulenceDisplacementNode.mul(turbulenceAmount))
               )
-              .r.toConst()
+            })
+            const shape = this.shapeTextureNode.sample(
+              positionWorld
+                .add(evolution)
+                .add(turbulence)
+                .mul(clouds.shapeRepeatNode)
+                .add(clouds.shapeOffsetNode)
+            ).r.toConst()
             const density = remapClamp(
               weatherDensity,
               vec4(1).sub(shape).mul(clouds.shapeAmountsNode),
               vec4(1)
             ).toVar()
-            const densityMean = density.x
-              .add(density.y)
-              .add(density.z)
-              .add(density.w)
-              .mul(0.25)
-              .toConst()
-            const densityEdgeFade = remapClamp(
-              densityMean,
-              float(0.04),
-              float(0.18)
-            ).toConst()
-            const detailFade = remapClamp(
-              highFrequencyWeight
-              .mul(densityEdgeFade.pow2())
-              .mul(float(1).sub(remapClamp(mipLevel, float(0.1), float(0.85)))),
-              float(SHAPE_DETAIL_FADE_FLOOR),
-              float(1)
-            )
-              .toConst()
             const shapeDetailPosition = positionWorld
               .add(turbulence)
               .mul(clouds.shapeDetailRepeatNode)
               .add(clouds.shapeDetailOffsetNode)
               .toConst()
-            const detail = textureLevel(
-              this.shapeDetailTextureNode,
-              shapeDetailPosition,
-              mipLevel
-            ).r.toConst()
-              If(
-                clouds.shapeDetailNode.and(detailFade.greaterThan(EPSILON)),
-                () => {
-                  const modifier = mix(
-                    vec4(detail.pow(6)),
-                    vec4(1).sub(detail),
-                    remapClamp(heightFraction, vec4(0.2), vec4(0.4))
-                  )
+            const detail = this.shapeDetailTextureNode
+              .sample(shapeDetailPosition)
+              .r.toConst()
+            const detailEnabled = mipLevel
+              .mul(0.5)
+              .add(jitter.sub(0.5).mul(0.5))
+              .lessThan(0.5)
+              .toConst()
+            If(
+              clouds.shapeDetailNode.and(detailEnabled),
+              () => {
+                const modifier = mix(
+                  vec4(detail.pow(6)),
+                  vec4(1).sub(detail),
+                  remapClamp(heightFraction, vec4(0.2), vec4(0.4))
+                )
                   .mul(clouds.shapeDetailAmountsNode)
                   .toConst()
-                  const detailedDensity = remapClamp(
-                    density.mul(2),
-                    modifier.mul(0.5),
-                    vec4(1)
-                  ).toConst()
-                  density.assign(mix(density, detailedDensity, detailFade))
-                }
-              )
+                const detailedDensity = remapClamp(
+                  density.mul(2),
+                  modifier.mul(0.5),
+                  vec4(1)
+                ).toConst()
+                density.assign(detailedDensity)
+              }
+            )
             density.assign(
               density
                 .mul(clouds.densityScalesNode)
@@ -1042,6 +1133,7 @@ export class CloudsNode extends TempNode {
                     .add(clouds.densityProfileConstantTermsNode)
                 )
                 .saturate()
+                .mul(activeLayerMask)
             )
             const densitySum = density.x
               .add(density.y)
@@ -1050,13 +1142,11 @@ export class CloudsNode extends TempNode {
               .toConst()
             If(densitySum.greaterThan(clouds.minDensityNode), () => {
               extinction.assign(
-                densitySum
-                  .mul(
-                    clouds.scatteringCoefficientNode.add(
-                      clouds.absorptionCoefficientNode
-                    )
+                densitySum.mul(
+                  clouds.scatteringCoefficientNode.add(
+                    clouds.absorptionCoefficientNode
                   )
-                  .max(clouds.minExtinctionNode)
+                )
               )
             })
           }
@@ -1100,7 +1190,13 @@ export class CloudsNode extends TempNode {
       }
     )
     const approximateGroundRadiance = Fn(
-      ([positionUnit, surfaceNormal, height, mipLevel, jitter]: [
+      ([
+        positionUnit,
+        surfaceNormal,
+        height,
+        mipLevel,
+        jitter,
+      ]: [
         Node<'vec3'>,
         Node<'vec3'>,
         Node<'float'>,
@@ -1143,8 +1239,7 @@ export class CloudsNode extends TempNode {
               const secondaryExtinction = sampleExtinctionAt(
                 secondaryPositionUnit,
                 mipLevel,
-                jitter,
-                float(1)
+                jitter
               ).toConst()
 
               opticalDepthToGround.addAssign(
@@ -1159,17 +1254,15 @@ export class CloudsNode extends TempNode {
         const groundPointUnit = positionUnit
           .sub(surfaceNormal.mul(height.mul(atmosphere.worldToUnit)))
           .toConst()
-        const groundIlluminance = getSunAndSkyIlluminance(
+        const groundIlluminance = getSplitIlluminance(
           groundPointUnit,
           surfaceNormal,
           atmosphere.sunDirectionECEF
         ).toConst()
         const groundIrradiance = groundIlluminance
-          .get('skyIlluminance')
+          .get('indirect')
           .add(
-            groundIlluminance
-              .get('sunIlluminance')
-              .mul(clouds.coverageNode.oneMinus())
+            groundIlluminance.get('direct').mul(clouds.coverageNode.oneMinus())
           )
           .toConst()
         const bouncedRadiance = groundIrradiance.mul(0.3 / Math.PI).toConst()
@@ -1205,7 +1298,11 @@ export class CloudsNode extends TempNode {
           () => {
             const density = modulation
               .mul(clouds.hazeDensityScaleNode)
-              .mul(exp(atmosphere.cameraHeight.negate().mul(clouds.hazeExponentNode)))
+              .mul(
+                exp(
+                  atmosphere.cameraHeight.negate().mul(clouds.hazeExponentNode)
+                )
+              )
               .toConst()
 
             If(density.lessThan(float(1e-7)).not(), () => {
@@ -1224,7 +1321,24 @@ export class CloudsNode extends TempNode {
                 normalAtHorizon,
                 horizonBlend
               ).toConst()
-              const angle = max(normal.dot(rayDirectionUnit), float(1e-5)).toConst()
+              const radius = rayOriginUnit.length().toConst()
+              const cosHorizon = sqrt(
+                max(
+                  float(0),
+                  float(1).sub(
+                    atmosphere.bottomRadius
+                      .pow2()
+                      .div(radius.pow2().max(EPSILON))
+                  )
+                )
+              )
+                .negate()
+                .toConst()
+              const cosView = max(
+                normal.dot(rayDirectionUnit),
+                cosHorizon.add(float(0.004))
+              ).toConst()
+              const angle = max(cosView, float(1e-5)).toConst()
               const exponent = angle.mul(clouds.hazeExponentNode).toConst()
               const linearTerm = density
                 .div(clouds.hazeExponentNode.max(EPSILON))
@@ -1256,12 +1370,12 @@ export class CloudsNode extends TempNode {
                 .sub(exp(shadowOpticalDepth.negate()))
                 .saturate()
                 .toConst()
-              const illumination = getSunAndSkyScalarIlluminance(
+              const illumination = getSplitScalarIlluminance(
                 rayOriginUnit,
                 atmosphere.sunDirectionECEF
               ).toConst()
               const inscatter = illumination
-                .get('sunIlluminance')
+                .get('direct')
                 .mul(
                   dualLobePhase(
                     cosTheta,
@@ -1273,7 +1387,7 @@ export class CloudsNode extends TempNode {
                 .mul(shadowTransmittance)
                 .add(
                   illumination
-                    .get('skyIlluminance')
+                    .get('indirect')
                     .mul(float(RECIPROCAL_PI4))
                     .mul(clouds.skyLightScaleNode)
                     .mul(transmittance)
@@ -1299,12 +1413,7 @@ export class CloudsNode extends TempNode {
       cloudsShadowNode == null || !clouds.lightShafts
         ? null
         : Fn(
-            ([
-              rayOriginWorld,
-              rayDirectionWorld,
-              maxRayDistanceWorld,
-              jitter
-            ]: [
+            ([rayOriginWorld, rayDirectionWorld, maxRayDistanceWorld, jitter]: [
               Node<'vec3'>,
               Node<'vec3'>,
               Node<'float'>,
@@ -1331,9 +1440,12 @@ export class CloudsNode extends TempNode {
                         Break()
                       }
                     )
-                    If(rayDistanceWorld.greaterThan(maxRayDistanceWorld), () => {
-                      Break()
-                    })
+                    If(
+                      rayDistanceWorld.greaterThan(maxRayDistanceWorld),
+                      () => {
+                        Break()
+                      }
+                    )
 
                     const samplePositionWorld = rayOriginWorld
                       .add(rayDirectionWorld.mul(rayDistanceWorld))
@@ -1396,10 +1508,7 @@ export class CloudsNode extends TempNode {
             ? viewZToPerspectiveDepth(viewZ, near, far)
             : viewZToOrthographicDepth(viewZ, near, far)
 
-      const farViewZ = depthToViewZ(float(1), near, far, {
-        perspective,
-        logarithmic
-      }).toConst()
+      const farViewZ = depthToViewZ(float(1), this.camera, near, far).toConst()
       const farPositionView = screenToPositionView(
         texCoord,
         float(1),
@@ -1415,10 +1524,16 @@ export class CloudsNode extends TempNode {
       const sceneDepthBlend = float(1)
         .sub(remapClamp(depth, float(0.999), float(1)))
         .toConst()
-      const sceneViewZ = depthToViewZ(depth, near, far, {
-        perspective,
-        logarithmic
-      }).toConst()
+      // The Fuji no-tiles WebGPU branch renders a fallback ellipsoid before
+      // clouds. In LEO parity views its reconstructed depth can sit in front
+      // of the cloud interval, so depth clipping is kept for low-altitude views
+      // and disabled once the dynamic camera far marks a high-orbit capture.
+      const sceneDepthClip = depth
+        .lessThan(float(1))
+        .and(far.lessThan(1e6))
+        .toFloat()
+        .toConst()
+      const sceneViewZ = depthToViewZ(depth, this.camera, near, far).toConst()
       const scenePositionView = screenToPositionView(
         texCoord,
         depth,
@@ -1445,8 +1560,10 @@ export class CloudsNode extends TempNode {
         vec3(0)
       ).toConst()
       const unitToWorld = float(1).div(atmosphere.worldToUnit).toConst()
-      const safeShapeRepeat = max(clouds.shapeRepeatNode.abs(), vec3(EPSILON))
-        .toConst()
+      const safeShapeRepeat = max(
+        clouds.shapeRepeatNode.abs(),
+        vec3(EPSILON)
+      ).toConst()
       const safeShapeDetailRepeat = max(
         clouds.shapeDetailRepeatNode.abs(),
         vec3(EPSILON)
@@ -1491,10 +1608,7 @@ export class CloudsNode extends TempNode {
             )
               .normalize()
               .toConst()
-            const tangentNorthUnit = cross(
-              surfaceNormalUnit,
-              tangentEastUnit
-            )
+            const tangentNorthUnit = cross(surfaceNormalUnit, tangentEastUnit)
               .normalize()
               .toConst()
             const tangentStepUnit = float(LOCAL_WEATHER_TANGENT_STEP_WORLD)
@@ -1502,12 +1616,14 @@ export class CloudsNode extends TempNode {
               .toConst()
             const baseUv = getGlobeUv(positionUnit).toConst()
             const eastUvDelta = wrapPeriodicUvDelta(
-              getGlobeUv(positionUnit.add(tangentEastUnit.mul(tangentStepUnit)))
-                .sub(baseUv)
+              getGlobeUv(
+                positionUnit.add(tangentEastUnit.mul(tangentStepUnit))
+              ).sub(baseUv)
             ).toConst()
             const northUvDelta = wrapPeriodicUvDelta(
-              getGlobeUv(positionUnit.add(tangentNorthUnit.mul(tangentStepUnit)))
-                .sub(baseUv)
+              getGlobeUv(
+                positionUnit.add(tangentNorthUnit.mul(tangentStepUnit))
+              ).sub(baseUv)
             ).toConst()
             const determinant = eastUvDelta.x
               .mul(northUvDelta.y)
@@ -1535,9 +1651,9 @@ export class CloudsNode extends TempNode {
                   .toConst()
 
                 localWeatherMotionWorld.assign(
-                  atmosphere.matrixECEFToWorld
-                    .mul(vec4(localWeatherMotionECEF, 0))
-                    .xyz
+                  atmosphere.matrixECEFToWorld.mul(
+                    vec4(localWeatherMotionECEF, 0)
+                  ).xyz
                 )
               }
             )
@@ -1555,13 +1671,17 @@ export class CloudsNode extends TempNode {
         .add(altitudeCorrectionUnit)
         .toConst()
 
-      // Match legacy semantics: clamp against scene hit distance along the
-      // current view ray, not the Euclidean point-to-point distance. Blend the
-      // clamp near depth==1 to avoid horizon discontinuities.
+      // LEO cameras need an unclamped background ray, while low-altitude views
+      // retain the camera far guard that protects current scene-depth parity.
+      const backgroundSceneDistance = select(
+        far.greaterThan(1e6),
+        float(1e20),
+        far.mul(atmosphere.worldToUnit)
+      ).toConst()
       const sceneDistance = mix(
-        clouds.maxRayDistanceNode.mul(atmosphere.worldToUnit),
+        backgroundSceneDistance,
         max(scenePositionUnit.sub(cameraPositionUnit).dot(rayDirectionUnit), 0),
-        sceneDepthBlend
+        sceneDepthClip
       ).toConst()
       const sceneDistanceWorld = sceneDistance.mul(unitToWorld).toConst()
       const globalShadowLengthWorld = (this.cloudsShadowLengthNode ?? float(0))
@@ -1663,7 +1783,9 @@ export class CloudsNode extends TempNode {
               )
             )
           })
-          shadowNearFarWorld.y.assign(min(shadowNearFarWorld.y, sceneDistanceWorld))
+          shadowNearFarWorld.y.assign(
+            min(shadowNearFarWorld.y, sceneDistanceWorld)
+          )
         }
       )
 
@@ -1769,7 +1891,12 @@ export class CloudsNode extends TempNode {
             const positionUnit = cameraPositionUnit
               .add(rayDirectionUnit.mul(rayDistance))
               .toConst()
-            const rayDistanceWorld = rayDistance.mul(unitToWorld).toConst()
+            // WebGL marchClouds receives the ray origin at segmentStart, so
+            // its mip growth uses distance traveled inside the cloud interval.
+            const rayDistanceWorld = rayDistance
+              .sub(segmentStart)
+              .mul(unitToWorld)
+              .toConst()
             const mipLevel = log2(
               max(
                 float(1),
@@ -1799,6 +1926,26 @@ export class CloudsNode extends TempNode {
               }
             )
 
+            // Match WebGL's primary march interval guard. Without this skip,
+            // high-orbit views sample across layer gaps and lose the large
+            // banded weather structure visible in the WebGL reference.
+            const insideLayerIntervals = height
+              .greaterThan(clouds.minIntervalHeightsNode)
+              .and(height.lessThan(clouds.maxIntervalHeightsNode))
+              .any()
+              .toConst()
+            If(insideLayerIntervals, () => {
+              stepSizeWorld.mulAssign(clouds.perspectiveStepScaleNode)
+              rayDistance.addAssign(
+                mix(
+                  stepSizeWorld,
+                  clouds.maxStepSizeNode,
+                  min(float(1), mipLevel)
+                ).mul(atmosphere.worldToUnit)
+              )
+              Continue()
+            })
+
             const weatherUv = getGlobeUv(positionUnit)
             const weatherCoord = weatherUv
               .mul(clouds.localWeatherRepeatNode)
@@ -1809,20 +1956,54 @@ export class CloudsNode extends TempNode {
               weatherCoord,
               mipLevel
             ).rgba.toConst()
+            const layerHeightSpan = clouds.maxLayerHeightsNode
+              .sub(clouds.minLayerHeightsNode)
+              .toConst()
+            const activeLayerMask = vec4(
+              layerHeightSpan.x.greaterThan(float(EPSILON)).toFloat(),
+              layerHeightSpan.y.greaterThan(float(EPSILON)).toFloat(),
+              layerHeightSpan.z.greaterThan(float(EPSILON)).toFloat(),
+              layerHeightSpan.w.greaterThan(float(EPSILON)).toFloat()
+            ).toConst()
+            const safeMaxLayerHeights = vec4(
+              mix(
+                clouds.minLayerHeightsNode.x.add(1),
+                clouds.maxLayerHeightsNode.x,
+                activeLayerMask.x
+              ),
+              mix(
+                clouds.minLayerHeightsNode.y.add(1),
+                clouds.maxLayerHeightsNode.y,
+                activeLayerMask.y
+              ),
+              mix(
+                clouds.minLayerHeightsNode.z.add(1),
+                clouds.maxLayerHeightsNode.z,
+                activeLayerMask.z
+              ),
+              mix(
+                clouds.minLayerHeightsNode.w.add(1),
+                clouds.maxLayerHeightsNode.w,
+                activeLayerMask.w
+              )
+            ).toConst()
             const mappedWeather = vec4(
               dot(localWeather, clouds.localWeatherChannelMask0Node),
               dot(localWeather, clouds.localWeatherChannelMask1Node),
               dot(localWeather, clouds.localWeatherChannelMask2Node),
               dot(localWeather, clouds.localWeatherChannelMask3Node)
             )
+              .mul(activeLayerMask)
               .pow(clouds.weatherExponentsNode)
               .toVar()
 
             const heightFraction = remapClamp(
               vec4(height),
               clouds.minLayerHeightsNode,
-              clouds.maxLayerHeightsNode
-            ).toConst()
+              safeMaxLayerHeights
+            )
+              .mul(activeLayerMask)
+              .toConst()
             const biased = heightFraction
               .pow(clouds.shapeAlteringBiasesNode)
               .mul(2)
@@ -1837,22 +2018,13 @@ export class CloudsNode extends TempNode {
               mix(mappedWeather, vec4(1), clouds.coverageFilterWidthsNode),
               coverageFactor,
               coverageFactor.add(clouds.coverageFilterWidthsNode)
-            ).toVar()
-            const weatherDensityMean = weatherDensity.x
-              .add(weatherDensity.y)
-              .add(weatherDensity.z)
-              .add(weatherDensity.w)
-              .mul(0.25)
-              .toConst()
+            )
+              .mul(activeLayerMask)
+              .toVar()
             const hasRoughDensity = weatherDensity
               .greaterThan(vec4(clouds.minDensityNode))
               .any()
               .toConst()
-            const edgeFade = remapClamp(
-              weatherDensityMean,
-              float(0.05),
-              float(0.22)
-            ).toConst()
 
             If(hasRoughDensity.not(), () => {
               stepSizeWorld.mulAssign(clouds.perspectiveStepScaleNode)
@@ -1876,105 +2048,69 @@ export class CloudsNode extends TempNode {
               .mul(localWeatherSpeed)
               .mul(2e4)
               .toConst()
-            const highFrequencyWeight = float(1)
-              .sub(
-                remapClamp(
-                  rayDistanceWorld,
-                  float(HIGH_FREQUENCY_FADE_START),
-                  float(HIGH_FREQUENCY_FADE_END)
-                )
-              )
-              .toConst()
             const turbulenceAmount = weatherDensity
               .dot(remapClamp(heightFraction, vec4(0.3), vec4(0)))
-              .mul(highFrequencyWeight)
-              .mul(edgeFade)
               .toConst()
             const turbulence = vec3(0).toVar()
-            If(
-              clouds.turbulenceNode.and(
-                highFrequencyWeight.greaterThan(EPSILON)
-              ),
-              () => {
-                turbulence.assign(
-                  textureLevel(
-                    this.turbulenceTextureNode,
+            If(clouds.turbulenceNode, () => {
+              turbulence.assign(
+                // Match WebGL: only weather uses explicit LOD; 3D/noise fields
+                // keep implicit filtering so high-orbit views preserve shape.
+                this.turbulenceTextureNode
+                  .sample(
                     weatherUv
                       .mul(clouds.localWeatherRepeatNode)
-                      .mul(clouds.turbulenceRepeatNode),
-                    mipLevel
+                      .mul(clouds.turbulenceRepeatNode)
                   )
-                    .rgb.mul(2)
-                    .sub(1)
-                    .mul(
-                      clouds.turbulenceDisplacementNode.mul(turbulenceAmount)
-                    )
-                )
-              }
-            )
+                  .rgb.mul(2)
+                  .sub(1)
+                  .mul(clouds.turbulenceDisplacementNode.mul(turbulenceAmount))
+              )
+            })
 
-            const shape = textureLevel(
-              this.shapeTextureNode,
+            const shape = this.shapeTextureNode.sample(
               positionWorld
                 .add(evolution)
                 .add(turbulence)
                 .mul(clouds.shapeRepeatNode)
-                .add(clouds.shapeOffsetNode),
-              mipLevel
-            )
-              .r.toConst()
+                .add(clouds.shapeOffsetNode)
+            ).r.toConst()
             let density = remapClamp(
               weatherDensity,
               vec4(1).sub(shape).mul(clouds.shapeAmountsNode),
               vec4(1)
             ).toVar()
-            const densityMean = density.x
-              .add(density.y)
-              .add(density.z)
-              .add(density.w)
-              .mul(0.25)
-              .toConst()
-            const densityEdgeFade = remapClamp(
-              densityMean,
-              float(0.04),
-              float(0.18)
-            ).toConst()
-            const detailFade = remapClamp(
-              highFrequencyWeight
-              .mul(densityEdgeFade.pow2())
-              .mul(float(1).sub(remapClamp(mipLevel, float(0.1), float(0.85)))),
-              float(SHAPE_DETAIL_FADE_FLOOR),
-              float(1)
-            )
-              .toConst()
             const shapeDetailPosition = positionWorld
               .add(turbulence)
               .mul(clouds.shapeDetailRepeatNode)
               .add(clouds.shapeDetailOffsetNode)
               .toConst()
-            const detail = textureLevel(
-              this.shapeDetailTextureNode,
-              shapeDetailPosition,
-              mipLevel
-            ).r.toConst()
-              If(
-                clouds.shapeDetailNode.and(detailFade.greaterThan(EPSILON)),
-                () => {
-                  const modifier = mix(
-                    vec4(detail.pow(6)),
-                    vec4(1).sub(detail),
-                    remapClamp(heightFraction, vec4(0.2), vec4(0.4))
-                  )
+            const detail = this.shapeDetailTextureNode
+              .sample(shapeDetailPosition)
+              .r.toConst()
+            const detailEnabled = mipLevel
+              .mul(0.5)
+              .add(stochasticJitter.sub(0.5).mul(0.5))
+              .lessThan(0.5)
+              .toConst()
+            If(
+              clouds.shapeDetailNode.and(detailEnabled),
+              () => {
+                const modifier = mix(
+                  vec4(detail.pow(6)),
+                  vec4(1).sub(detail),
+                  remapClamp(heightFraction, vec4(0.2), vec4(0.4))
+                )
                   .mul(clouds.shapeDetailAmountsNode)
                   .toConst()
-                  const detailedDensity = remapClamp(
-                    density.mul(2),
-                    modifier.mul(0.5),
-                    vec4(1)
-                  ).toConst()
-                  density.assign(mix(density, detailedDensity, detailFade))
-                }
-              )
+                const detailedDensity = remapClamp(
+                  density.mul(2),
+                  modifier.mul(0.5),
+                  vec4(1)
+                ).toConst()
+                density.assign(detailedDensity)
+              }
+            )
 
             density.assign(
               density
@@ -1992,6 +2128,7 @@ export class CloudsNode extends TempNode {
                     .add(clouds.densityProfileConstantTermsNode)
                 )
                 .saturate()
+                .mul(activeLayerMask)
             )
 
             const densitySum = density.x
@@ -2003,7 +2140,7 @@ export class CloudsNode extends TempNode {
             const correctedPosition = positionUnit.toConst()
 
             If(densitySum.greaterThan(clouds.minDensityNode), () => {
-              const illumination = getSunAndSkyScalarIlluminance(
+              const illumination = getSplitScalarIlluminance(
                 correctedPosition,
                 atmosphere.sunDirectionECEF
               ).toConst()
@@ -2019,7 +2156,7 @@ export class CloudsNode extends TempNode {
                 .dot(mediaWeight)
                 .toConst()
               const skyLight = illumination
-                .get('skyIlluminance')
+                .get('indirect')
                 .mul(float(RECIPROCAL_PI4))
                 .mul(skyGradient)
                 .mul(clouds.skyLightScaleNode)
@@ -2034,7 +2171,6 @@ export class CloudsNode extends TempNode {
                     clouds.absorptionCoefficientNode
                   )
                 )
-                .max(clouds.minExtinctionNode)
                 .toConst()
               const sunOpticalDepth = float(0.5).toVar()
               const beerShadowOpticalDepth = float(0).toVar()
@@ -2076,8 +2212,7 @@ export class CloudsNode extends TempNode {
                     const secondaryExtinction = sampleExtinctionAt(
                       secondaryPositionUnit,
                       mipLevel,
-                      stochasticJitter,
-                      float(1)
+                      stochasticJitter
                     ).toConst()
 
                     sunOpticalDepth.addAssign(
@@ -2112,8 +2247,7 @@ export class CloudsNode extends TempNode {
                         1
                       )
                     )
-                    .xyz
-                    .toConst()
+                    .xyz.toConst()
                   beerShadowOpticalDepth.assign(
                     cloudsShadowNode
                       .sampleOpticalDepth(
@@ -2131,7 +2265,7 @@ export class CloudsNode extends TempNode {
                 })
               }
               const sunLight = illumination
-                .get('sunIlluminance')
+                .get('direct')
                 .mul(approximateMultipleScattering(sunOpticalDepth, cosTheta))
                 .toConst()
               const powderFactor = float(1)
@@ -2197,6 +2331,7 @@ export class CloudsNode extends TempNode {
               transmittance.assign(nextTransmittance)
             })
 
+
             stepSizeWorld.mulAssign(clouds.perspectiveStepScaleNode)
             rayDistance.addAssign(stepSizeWorld.mul(atmosphere.worldToUnit))
           }
@@ -2207,17 +2342,18 @@ export class CloudsNode extends TempNode {
           float(1),
           clouds.minTransmittanceNode
         ).toConst()
+        const sceneTransmission = alpha.oneMinus().toConst()
         const frontDistance = transmittanceWeightedDepth
           .div(transmittanceWeightSum.add(EPSILON))
           .toConst()
-        sceneColor.assign(vec4(baseSceneColor.mul(transmittance), sceneColor.a))
-        // Pack alpha, remaining transmittance, transmittance-weighted mean
-        // depth and the accumulated weight for downstream nodes.
+        sceneColor.assign(vec4(baseSceneColor, sceneColor.a))
+        // Match the WebGL overlay blend: clouds attenuate the scene by alpha,
+        // while physical transmittance remains internal to the march.
         transmittanceDepth
           .assign(
             vec4(
               alpha,
-              transmittance,
+              sceneTransmission,
               transmittanceWeightedDepth.div(
                 transmittanceWeightSum.add(EPSILON)
               ),
@@ -2227,111 +2363,109 @@ export class CloudsNode extends TempNode {
           .toConst()
 
         If(transmittanceWeightSum.greaterThan(EPSILON), () => {
-            const frontPositionUnit = cameraPositionUnit
-              .add(rayDirectionUnit.mul(frontDistance))
-              .toConst()
-            const frontDistanceWorld = frontDistance.mul(unitToWorld).toConst()
-            if (marchShadowLengthWorld != null) {
-              const cloudShadowNearFarWorld = shadowNearFarWorld.toVar()
-              cloudShadowNearFarWorld.y.assign(
-                mix(
-                  cloudShadowNearFarWorld.y,
-                  min(frontDistanceWorld, cloudShadowNearFarWorld.y),
-                  alpha
-                )
-              )
-              If(
-                cloudShadowNearFarWorld.x
-                  .greaterThanEqual(0)
-                  .and(
-                    cloudShadowNearFarWorld.y.greaterThan(
-                      cloudShadowNearFarWorld.x
-                    )
-                  ),
-                () => {
-                  shadowLengthWorld.assign(
-                    marchShadowLengthWorld(
-                      cameraWorld.add(
-                        rayDirectionWorld.mul(cloudShadowNearFarWorld.x)
-                      ),
-                      rayDirectionWorld,
-                      cloudShadowNearFarWorld.y.sub(cloudShadowNearFarWorld.x),
-                      stochasticJitter
-                    )
-                  )
-                }
-              )
-            }
-            const luminanceTransfer = getSkyLuminanceToPoint(
-              cameraPositionUnit,
-              frontPositionUnit,
-              shadowLengthWorld.mul(atmosphere.worldToUnit),
-              atmosphere.sunDirectionECEF
-            ).toConst()
-            sceneColor.assign(
-              vec4(
-                sceneColor.rgb.add(
-                  radiance
-                    .mul(luminanceTransfer.get('transmittance'))
-                    .add(luminanceTransfer.get('luminance').mul(alpha))
-                ),
-                sceneColor.a
-              )
-            )
-
-            hazeNearFarWorld.y.assign(
+          const frontPositionUnit = cameraPositionUnit
+            .add(rayDirectionUnit.mul(frontDistance))
+            .toConst()
+          const frontDistanceWorld = frontDistance.mul(unitToWorld).toConst()
+          if (marchShadowLengthWorld != null) {
+            const cloudShadowNearFarWorld = shadowNearFarWorld.toVar()
+            cloudShadowNearFarWorld.y.assign(
               mix(
-                hazeNearFarWorld.y,
-                min(frontDistanceWorld, hazeNearFarWorld.y),
+                cloudShadowNearFarWorld.y,
+                min(frontDistanceWorld, cloudShadowNearFarWorld.y),
                 alpha
               )
             )
-            const frontPositionWorld = cameraWorld
-              .add(rayDirectionWorld.mul(frontDistanceWorld))
-              .toConst()
-            const localWeatherMotionWorld = approximateLocalWeatherMotionWorld(
-              frontPositionUnit
-            ).toConst()
-            const frontNormalWorld = frontPositionWorld.normalize().toConst()
-            const currentEvolutionWorld = frontNormalWorld
-              .negate()
-              .mul(currentLocalWeatherSpeed)
-              .mul(2e4)
-              .toConst()
-            const previousEvolutionWorld = frontNormalWorld
-              .negate()
-              .mul(previousLocalWeatherSpeed)
-              .mul(2e4)
-              .toConst()
-            const previousFrontPositionWorld = frontPositionWorld
-              .add(shapeMotionWorld)
-              .add(shapeDetailMotionWorld)
-              .add(localWeatherMotionWorld)
-              .add(currentEvolutionWorld.sub(previousEvolutionWorld))
-              .toConst()
-            const frontPositionView = currentView
-              .mul(vec4(frontPositionWorld, 1))
-              .xyz.toConst()
-
-            const currentClip = currentProjection
-              .mul(currentView)
-              .mul(vec4(frontPositionWorld, 1))
-              .toConst()
-            const previousClip = previousProjection
-              .mul(previousView)
-              .mul(vec4(previousFrontPositionWorld, 1))
-              .toConst()
-            const currentNdc = currentClip.xyz
-              .div(currentClip.w.abs().max(EPSILON))
-              .toConst()
-            const previousNdc = previousClip.xyz
-              .div(previousClip.w.abs().max(EPSILON))
-              .toConst()
-            cloudVelocity.assign(vec4(currentNdc.sub(previousNdc), 1))
-
-            this.resolvedDepthNode.assign(encodeDepth(frontPositionView.z))
+            If(
+              cloudShadowNearFarWorld.x
+                .greaterThanEqual(0)
+                .and(
+                  cloudShadowNearFarWorld.y.greaterThan(
+                    cloudShadowNearFarWorld.x
+                  )
+                ),
+              () => {
+                shadowLengthWorld.assign(
+                  marchShadowLengthWorld(
+                    cameraWorld.add(
+                      rayDirectionWorld.mul(cloudShadowNearFarWorld.x)
+                    ),
+                    rayDirectionWorld,
+                    cloudShadowNearFarWorld.y.sub(cloudShadowNearFarWorld.x),
+                    stochasticJitter
+                  )
+                )
+              }
+            )
           }
-        )
+          const luminanceTransfer = getIndirectLuminanceToPoint(
+            cameraPositionUnit,
+            frontPositionUnit,
+            vec2(shadowLengthWorld.mul(atmosphere.worldToUnit), 0),
+            atmosphere.sunDirectionECEF
+          ).toConst()
+          const cloudRadiance = radiance
+            .mul(luminanceTransfer.get('transmittance'))
+            .add(luminanceTransfer.get('luminance').mul(alpha))
+            .toConst()
+          sceneColor.assign(
+            vec4(
+              baseSceneColor.mul(sceneTransmission).add(cloudRadiance),
+              sceneColor.a
+            )
+          )
+
+          hazeNearFarWorld.y.assign(
+            mix(
+              hazeNearFarWorld.y,
+              min(frontDistanceWorld, hazeNearFarWorld.y),
+              alpha
+            )
+          )
+          const frontPositionWorld = cameraWorld
+            .add(rayDirectionWorld.mul(frontDistanceWorld))
+            .toConst()
+          const localWeatherMotionWorld =
+            approximateLocalWeatherMotionWorld(frontPositionUnit).toConst()
+          const frontNormalWorld = frontPositionWorld.normalize().toConst()
+          const currentEvolutionWorld = frontNormalWorld
+            .negate()
+            .mul(currentLocalWeatherSpeed)
+            .mul(2e4)
+            .toConst()
+          const previousEvolutionWorld = frontNormalWorld
+            .negate()
+            .mul(previousLocalWeatherSpeed)
+            .mul(2e4)
+            .toConst()
+          const previousFrontPositionWorld = frontPositionWorld
+            .add(shapeMotionWorld)
+            .add(shapeDetailMotionWorld)
+            .add(localWeatherMotionWorld)
+            .add(currentEvolutionWorld.sub(previousEvolutionWorld))
+            .toConst()
+          const frontPositionView = currentView
+            .mul(vec4(frontPositionWorld, 1))
+            .xyz.toConst()
+
+          const currentClip = currentProjection
+            .mul(currentView)
+            .mul(vec4(frontPositionWorld, 1))
+            .toConst()
+          const previousClip = previousProjection
+            .mul(previousView)
+            .mul(vec4(previousFrontPositionWorld, 1))
+            .toConst()
+          const currentNdc = currentClip.xyz
+            .div(currentClip.w.abs().max(EPSILON))
+            .toConst()
+          const previousNdc = previousClip.xyz
+            .div(previousClip.w.abs().max(EPSILON))
+            .toConst()
+          cloudVelocity.assign(vec4(currentNdc.sub(previousNdc), 1))
+
+          this.resolvedDepthNode.assign(encodeDepth(frontPositionView.z))
+        })
       })
 
       const hazeDistanceWorld = max(
@@ -2341,7 +2475,9 @@ export class CloudsNode extends TempNode {
 
       If(hazeDistanceWorld.greaterThan(EPSILON), () => {
         const haze = approximateHaze(
-          cameraPositionUnit.add(rayDirectionUnit.mul(near.mul(atmosphere.worldToUnit))),
+          cameraPositionUnit.add(
+            rayDirectionUnit.mul(near.mul(atmosphere.worldToUnit))
+          ),
           rayDirectionUnit,
           hazeDistanceWorld,
           sunCosTheta,
