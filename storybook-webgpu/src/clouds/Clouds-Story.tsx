@@ -25,7 +25,7 @@ import {
 import { context, mix, pass, toneMapping, uniform, uv, vec3 } from 'three/tsl'
 import {
   MeshBasicNodeMaterial,
-  PostProcessing,
+  RenderPipeline,
   type Renderer
 } from 'three/webgpu'
 
@@ -732,7 +732,7 @@ const Content: FC<StoryProps> = () => {
   )
 
   const postProcessing = useResource(
-    () => new PostProcessing(renderer, toneMappingNode),
+    () => new RenderPipeline(renderer, toneMappingNode),
     [renderer, toneMappingNode]
   )
 

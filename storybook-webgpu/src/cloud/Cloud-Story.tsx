@@ -1,7 +1,7 @@
 import { OrbitControls } from '@react-three/drei'
 import { useFrame, useThree } from '@react-three/fiber'
 import {
-  useEffect,
+  useCallback,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -10,19 +10,11 @@ import {
 } from 'react'
 import {
   AgXToneMapping,
-  Data3DTexture,
-  LinearFilter,
-  LinearMipMapLinearFilter,
   Matrix4,
-  NoColorSpace,
   Quaternion,
-  RedFormat,
-  RepeatWrapping,
   Scene,
-  TextureLoader,
   Vector3,
-  type Mesh,
-  type Texture
+  type Mesh
 } from 'three'
 import {
   context,
@@ -34,12 +26,14 @@ import {
   toneMapping,
   uniform,
   uv,
+  viewportUV,
+  vec2,
   vec3,
   vec4
 } from 'three/tsl'
 import {
   MeshBasicNodeMaterial,
-  PostProcessing,
+  RenderPipeline,
   type Renderer
 } from 'three/webgpu'
 
@@ -52,29 +46,33 @@ import {
   aerialPerspective,
   AtmosphereContext
 } from '@takram/three-atmosphere/webgpu'
+import { CloudLayers, type CloudsQualityPreset } from '@takram/three-clouds'
 import {
-  CLOUD_SHAPE_DETAIL_TEXTURE_SIZE,
-  CLOUD_SHAPE_TEXTURE_SIZE,
-  CloudLayers,
-  type CloudsQualityPreset
-} from '@takram/three-clouds'
-import { clouds, CloudsContext } from '@takram/three-clouds/webgpu'
+  clouds,
+  cloudsShadow,
+  cloudsShadowLength,
+  CloudsContext
+} from '@takram/three-clouds/webgpu'
+import { Clouds as WebGPUCloudsContext } from '@takram/three-clouds/webgpu/r3f'
 import {
-  DataTextureLoader,
   Ellipsoid,
   Geodetic,
-  parseUint8Array,
   PointOfView,
-  radians,
-  STBNLoader
+  radians
 } from '@takram/three-geospatial'
 import { EllipsoidMesh } from '@takram/three-geospatial/r3f'
 import {
   dithering,
   highpVelocity,
-  lensFlare
+  lensFlare,
+  stationaryDithering
 } from '@takram/three-geospatial/webgpu'
 
+import localWeatherUrl from '../../../packages/clouds/assets/local_weather.png?url'
+import shapeDetailUrl from '../../../packages/clouds/assets/shape_detail.bin?url'
+import shapeUrl from '../../../packages/clouds/assets/shape.bin?url'
+import turbulenceUrl from '../../../packages/clouds/assets/turbulence.png?url'
+import stbnUrl from '../../../packages/core/assets/stbn.bin?url'
 import { applyCloudStoryPreset } from '../clouds/storyPresets'
 import type { StoryFC } from '../components/createStory'
 import { Description, TilesAttribution } from '../components/Description'
@@ -100,11 +98,6 @@ import {
   useToneMappingControls,
   type ToneMappingArgs
 } from '../controls/toneMappingControls'
-import { useControl } from '../hooks/useControl'
-import { useGuardedFrame } from '../hooks/useGuardedFrame'
-import type { PointOfViewProps } from '../hooks/usePointOfView'
-import { useResource } from '../hooks/useResource'
-import { useTransientControl } from '../hooks/useTransientControl'
 import {
   applyCameraMatrixToCamera,
   serializeCameraComponents,
@@ -114,16 +107,16 @@ import {
   applyPointOfViewToCamera,
   readPointOfViewFromCamera
 } from '../helpers/cameraPointOfView'
+import { useControl } from '../hooks/useControl'
+import { useGuardedFrame } from '../hooks/useGuardedFrame'
+import type { PointOfViewProps } from '../hooks/usePointOfView'
+import { useResource } from '../hooks/useResource'
+import { useTransientControl } from '../hooks/useTransientControl'
 import {
   applyFujiNoTilesCloudPreset,
   FUJI_PARITY_ANCHOR_LATITUDE,
   FUJI_PARITY_ANCHOR_LONGITUDE
 } from './fujiParityPreset'
-import localWeatherUrl from '../../../packages/clouds/assets/local_weather.png?url'
-import shapeDetailUrl from '../../../packages/clouds/assets/shape_detail.bin?url'
-import shapeUrl from '../../../packages/clouds/assets/shape.bin?url'
-import turbulenceUrl from '../../../packages/clouds/assets/turbulence.png?url'
-import stbnUrl from '../../../packages/core/assets/stbn.bin?url'
 
 const LOCAL_WEATHER_VELOCITY = [0.001, 0] as const
 const SHAPE_VELOCITY = [0.00012, 0, 0] as const
@@ -161,81 +154,36 @@ function applyCloudMotion(
   cloudsContext.shapeDetailVelocity.setScalar(0)
 }
 
-function useLoadTexture(url: string): Texture | null {
-  const [texture, setTexture] = useState<Texture | null>(null)
-
-  useEffect(() => {
-    let active = true
-    const loaded = new TextureLoader().load(url, texture => {
-      texture.minFilter = LinearMipMapLinearFilter
-      texture.magFilter = LinearFilter
-      texture.wrapS = RepeatWrapping
-      texture.wrapT = RepeatWrapping
-      texture.colorSpace = NoColorSpace
-      texture.needsUpdate = true
-      if (active) {
-        setTexture(texture)
-      }
-    })
-    return () => {
-      active = false
-      setTexture(null)
-      loaded.dispose()
-    }
-  }, [url])
-
-  return texture
-}
-
-function useLoad3DTexture(url: string, size: number): Data3DTexture | null {
-  const [texture, setTexture] = useState<Data3DTexture | null>(null)
-
-  useEffect(() => {
-    let active = true
-    const loaded = new DataTextureLoader(Data3DTexture, parseUint8Array, {
-      width: size,
-      height: size,
-      depth: size,
-      format: RedFormat,
-      minFilter: LinearFilter,
-      magFilter: LinearFilter,
-      wrapS: RepeatWrapping,
-      wrapT: RepeatWrapping,
-      wrapR: RepeatWrapping,
-      colorSpace: NoColorSpace
-    }).load(url, (texture: Data3DTexture) => {
-      if (active) {
-        setTexture(texture)
-      }
-    })
-    return () => {
-      active = false
-      setTexture(null)
-      loaded.dispose()
-    }
-  }, [url, size])
-
-  return texture
-}
-
-function useLoadStbnTexture(url: string): Data3DTexture | null {
-  const [texture, setTexture] = useState<Data3DTexture | null>(null)
-
-  useEffect(() => {
-    let active = true
-    const loaded = new STBNLoader().load(url, (texture: Data3DTexture) => {
-      if (active) {
-        setTexture(texture)
-      }
-    })
-    return () => {
-      active = false
-      setTexture(null)
-      loaded.dispose()
-    }
-  }, [url])
-
-  return texture
+function applyWebGLLikeMarchBudget(
+  cloudsContext: CloudsContext,
+  cameraFar: number = 4e5
+): void {
+  Object.assign(cloudsContext.clouds, {
+    maxIterationCount: 500,
+    minStepSize: 50,
+    maxStepSize: 1000,
+    maxRayDistance: 2e5,
+    perspectiveStepScale: 1.01,
+    minDensity: 1e-5,
+    minExtinction: 1e-5,
+    minTransmittance: 1e-2,
+    maxIterationCountToGround: 3,
+    maxIterationCountToSun: 12,
+    minSecondaryStepSize: 100,
+    secondaryStepScale: 2,
+    maxShadowFilterRadius: 6,
+    maxShadowLengthIterationCount: 500,
+    minShadowLengthStepSize: 50,
+    maxShadowLengthRayDistance: 2e5,
+    hazeDensityScale: 3e-5,
+    hazeExponent: 1e-3,
+    hazeScatteringCoefficient: 0.9,
+    hazeAbsorptionCoefficient: 0.8
+  })
+  cloudsContext.shadow.farScale = 0.25
+  cloudsContext.shadow.maxFar = cameraFar * cloudsContext.shadow.farScale
+  cloudsContext.skyLightScale = 0.79
+  cloudsContext.scatterAnisotropy1 = 0.58
 }
 
 interface StoryProps extends PointOfViewProps {
@@ -249,13 +197,17 @@ interface StoryProps extends PointOfViewProps {
   disableTiles?: boolean
   enableOrbitControls?: boolean
   orbitControlsTarget?: [number, number, number]
+  cameraFar?: number
   hideDescription?: boolean
   cameraMatrixElements?: number[] | null
   cameraComponents?: number[] | null
   onCameraMatrixChange?: (elements: number[]) => void
   onCameraComponentsChange?: (components: number[]) => void
   alignWithWebGLLightingModel?: boolean
+  enableCloudShadowAtlas?: boolean
 }
+
+type DebugRenderStage = 'final' | 'base' | 'aerial' | 'cloud'
 
 interface StoryArgs extends OutputPassArgs, ToneMappingArgs, LocalDateArgs {
   googleMapsApiKey: string
@@ -264,6 +216,10 @@ interface StoryArgs extends OutputPassArgs, ToneMappingArgs, LocalDateArgs {
   qualityPreset: CloudsQualityPreset
   resolutionScale: number
   taaEnabled: boolean
+  discardAllHistory: boolean
+  velocityThresholdPixels: number
+  historyResetDistanceThreshold: number
+  temporalAlpha: number
   temporalUpscale: boolean
   temporalUpscaleScale: number
   animateClouds: boolean
@@ -271,6 +227,11 @@ interface StoryArgs extends OutputPassArgs, ToneMappingArgs, LocalDateArgs {
   shapeDetail: boolean
   turbulence: boolean
   haze: boolean
+  debugRenderStage?: DebugRenderStage
+  debugDisableAerialLighting?: boolean
+  debugDisableGeometricCorrection?: boolean
+  debugDisableAerialNormal?: boolean
+  debugFreezeLocalDate?: boolean
 }
 
 const Content: FC<StoryProps> = ({
@@ -289,6 +250,8 @@ const Content: FC<StoryProps> = ({
   useIdentityWorldToECEFFrame = false,
   disableTiles = false,
   alignWithWebGLLightingModel = false,
+  enableCloudShadowAtlas = false,
+  cameraFar,
   cameraMatrixElements = null,
   cameraComponents = null,
   onCameraMatrixChange,
@@ -304,20 +267,20 @@ const Content: FC<StoryProps> = ({
   const appliedCameraComponentsSignatureRef = useRef<string>('')
   const emittedCameraComponentsSignatureRef = useRef<string>('')
 
-  const atmosphereContext = useResource(() => new AtmosphereContext(), [])
+  const atmosphereContext = useResource(() => {
+    const context = new AtmosphereContext()
+    if (alignWithWebGLLightingModel && cameraFar != null && cameraFar > 1e6) {
+      context.parameters.groundAlbedo.setScalar(0.25)
+    }
+    if (alignWithWebGLLightingModel) {
+      // Match the WebGL aerial-perspective lookup path and avoid frame-varying
+      // STBN raymarch noise in static parity captures.
+      context.raymarchScattering = false
+    }
+    return context
+  }, [alignWithWebGLLightingModel, cameraFar])
   atmosphereContext.camera = camera
-
-  const localWeatherTexture = useLoadTexture(localWeatherUrl)
-  const shapeTexture = useLoad3DTexture(
-    shapeUrl,
-    CLOUD_SHAPE_TEXTURE_SIZE
-  )
-  const shapeDetailTexture = useLoad3DTexture(
-    shapeDetailUrl,
-    CLOUD_SHAPE_DETAIL_TEXTURE_SIZE
-  )
-  const turbulenceTexture = useLoadTexture(turbulenceUrl)
-  const stbnTexture = useLoadStbnTexture(stbnUrl)
+  const cloudsShadowNode = useResource(() => cloudsShadow(camera), [camera])
 
   const cloudsContext = useResource(() => {
     const context = new CloudsContext()
@@ -330,38 +293,6 @@ const Content: FC<StoryProps> = ({
     applyCloudMotion(context, false, 1)
     return context
   }, [alignWithWebGLBasic, disableCloudStoryPreset, useFujiNoTilesCloudPreset])
-
-  useLayoutEffect(() => {
-    if (
-      localWeatherTexture == null ||
-      shapeTexture == null ||
-      shapeDetailTexture == null ||
-      turbulenceTexture == null ||
-      stbnTexture == null
-    ) {
-      return
-    }
-    cloudsContext.localWeatherTexture = localWeatherTexture
-    cloudsContext.shapeTexture = shapeTexture
-    cloudsContext.shapeDetailTexture = shapeDetailTexture
-    cloudsContext.turbulenceTexture = turbulenceTexture
-    cloudsContext.stbnTexture = stbnTexture
-  }, [
-    cloudsContext,
-    localWeatherTexture,
-    shapeTexture,
-    shapeDetailTexture,
-    turbulenceTexture,
-    stbnTexture
-  ])
-
-  useLayoutEffect(() => {
-    renderer.contextNode = context({
-      ...renderer.contextNode.value,
-      getAtmosphere: () => atmosphereContext,
-      getClouds: () => cloudsContext
-    })
-  }, [renderer, atmosphereContext, cloudsContext])
 
   const apiKey = useControl(({ googleMapsApiKey }: StoryArgs) =>
     !disableTiles && googleMapsApiKey !== '' ? googleMapsApiKey : undefined
@@ -380,6 +311,19 @@ const Content: FC<StoryProps> = ({
     ({ resolutionScale }: StoryArgs) => resolutionScale
   )
   const taaEnabled = useControl(({ taaEnabled }: StoryArgs) => taaEnabled)
+  const discardAllHistory = useControl(
+    ({ discardAllHistory }: StoryArgs) => discardAllHistory
+  )
+  const velocityThresholdPixels = useControl(
+    ({ velocityThresholdPixels }: StoryArgs) => velocityThresholdPixels
+  )
+  const historyResetDistanceThreshold = useControl(
+    ({ historyResetDistanceThreshold }: StoryArgs) =>
+      historyResetDistanceThreshold
+  )
+  const temporalAlpha = useControl(
+    ({ temporalAlpha }: StoryArgs) => temporalAlpha
+  )
   const temporalUpscaleScale = useControl(
     ({ temporalUpscaleScale }: StoryArgs) => temporalUpscaleScale
   )
@@ -392,6 +336,46 @@ const Content: FC<StoryProps> = ({
   const shapeDetail = useControl(({ shapeDetail }: StoryArgs) => shapeDetail)
   const turbulence = useControl(({ turbulence }: StoryArgs) => turbulence)
   const haze = useControl(({ haze }: StoryArgs) => haze)
+  const debugRenderStage = useControl(
+    ({ debugRenderStage = 'final' }: StoryArgs) => debugRenderStage
+  )
+  const debugDisableAerialLighting = useControl(
+    ({ debugDisableAerialLighting = false }: StoryArgs) =>
+      debugDisableAerialLighting
+  )
+  const debugDisableGeometricCorrection = useControl(
+    ({ debugDisableGeometricCorrection = false }: StoryArgs) =>
+      debugDisableGeometricCorrection
+  )
+  const debugDisableAerialNormal = useControl(
+    ({ debugDisableAerialNormal = false }: StoryArgs) =>
+      debugDisableAerialNormal
+  )
+  const debugFreezeLocalDate = useControl(
+    ({ debugFreezeLocalDate = false }: StoryArgs) => debugFreezeLocalDate
+  )
+  const debugDayOfYear = useControl(({ dayOfYear }: StoryArgs) => dayOfYear)
+  const debugTimeOfDay = useControl(({ timeOfDay }: StoryArgs) => timeOfDay)
+  const debugYear = useControl(({ year }: StoryArgs) => year)
+  const useStableHighOrbitParity =
+    alignWithWebGLLightingModel && cameraFar != null && cameraFar > 1e6
+  const useCloudShadowAtlas = enableCloudShadowAtlas
+  const useCloudShadowLength = enableCloudShadowAtlas && !useStableHighOrbitParity
+
+  useLayoutEffect(() => {
+    if (cameraFar == null) {
+      return
+    }
+    const cameraWithProjection = camera as typeof camera & {
+      far: number
+      updateProjectionMatrix: () => void
+    }
+    if (cameraWithProjection.far === cameraFar) {
+      return
+    }
+    cameraWithProjection.far = cameraFar
+    cameraWithProjection.updateProjectionMatrix()
+  }, [camera, cameraFar])
 
   useLayoutEffect(() => {
     if (apiKey != null) {
@@ -445,14 +429,7 @@ const Content: FC<StoryProps> = ({
       applyCloudStoryPreset(cloudsContext, 'ground')
     }
     if (forceWebglLikeMarchBudget) {
-      cloudsContext.clouds.maxIterationCount = 256
-      cloudsContext.clouds.minStepSize = 50
-      cloudsContext.clouds.maxStepSize = 1000
-      cloudsContext.clouds.perspectiveStepScale = 1.01
-      cloudsContext.clouds.minDensity = 1e-5
-      cloudsContext.clouds.minExtinction = 1e-5
-      cloudsContext.clouds.maxIterationCountToGround = 3
-      cloudsContext.clouds.maxIterationCountToSun = 2
+      applyWebGLLikeMarchBudget(cloudsContext, cameraFar)
     }
     const baseCoverage = alignWithWebGLBasic
       ? Math.min(coverage * (5 / 3), 1)
@@ -460,10 +437,15 @@ const Content: FC<StoryProps> = ({
     cloudsContext.coverage = baseCoverage
     cloudsContext.resolutionScale = resolutionScale
     cloudsContext.temporalAntialias = taaEnabled
-    // Keep stochastic blue-noise animation aligned with temporal accumulation.
-    // When TAA is off, freeze STBN to avoid frame-to-frame shimmer diagnostics.
-    cloudsContext.animateStbn = taaEnabled
-    if (!taaEnabled) {
+    cloudsContext.discardAllHistory = discardAllHistory
+    cloudsContext.velocityThresholdPixels = velocityThresholdPixels
+    cloudsContext.historyResetDistanceThreshold = historyResetDistanceThreshold
+    cloudsContext.temporalAlpha = temporalAlpha < 0 ? null : temporalAlpha
+    // Keep static comparison captures deterministic; moving clouds still animate
+    // blue-noise samples so temporal accumulation can converge over time.
+    const animateStbn = taaEnabled && animateClouds
+    cloudsContext.animateStbn = animateStbn
+    if (!animateStbn) {
       cloudsContext.stbnFrameIndex = 0
     }
     cloudsContext.temporalUpscaleScale = temporalUpscaleScale
@@ -479,34 +461,36 @@ const Content: FC<StoryProps> = ({
     cloudsContext,
     correctAltitude,
     coverage,
+    discardAllHistory,
     disableCloudStoryPreset,
     forceWebglLikeMarchBudget,
     haze,
+    historyResetDistanceThreshold,
+    cameraFar,
     qualityPreset,
     resolutionScale,
     shapeDetail,
     taaEnabled,
+    temporalAlpha,
     temporalUpscaleScale,
-    turbulence
+    turbulence,
+    velocityThresholdPixels
   ])
 
-  const fallbackGlobeMaterial = useResource(
-    () => {
-      if (alignWithWebGLLightingModel) {
-        return new MeshBasicNodeMaterial({
-          color: '#6b695e'
-        })
-      }
+  const fallbackGlobeMaterial = useResource(() => {
+    if (alignWithWebGLLightingModel) {
       return new MeshBasicNodeMaterial({
-        colorNode: mix(
-          vec3(0.18, 0.19, 0.16),
-          vec3(0.42, 0.4, 0.34),
-          uv().y.pow(1.55)
-        )
+        color: '#6b695e'
       })
-    },
-    [alignWithWebGLLightingModel]
-  )
+    }
+    return new MeshBasicNodeMaterial({
+      colorNode: mix(
+        vec3(0.18, 0.19, 0.16),
+        vec3(0.42, 0.4, 0.34),
+        uv().y.pow(1.55)
+      )
+    })
+  }, [alignWithWebGLLightingModel])
 
   const passNode = useResource(
     () =>
@@ -523,8 +507,37 @@ const Content: FC<StoryProps> = ({
   const colorNode = passNode.getTextureNode('output')
   const depthNode = passNode.getTextureNode('depth')
   const normalNode = passNode.getTextureNode('normal')
+  const shadowLengthNode = useResource(
+    () => cloudsShadowLength(depthNode, camera, cloudsShadowNode),
+    [depthNode, camera, cloudsShadowNode]
+  )
 
-  const enableWebGLLightingModel = alignWithWebGLLightingModel && apiKey != null
+  useLayoutEffect(() => {
+    cloudsShadowNode.setContexts(cloudsContext, atmosphereContext)
+    shadowLengthNode.setContexts(cloudsContext, atmosphereContext)
+    renderer.contextNode = context({
+      ...renderer.contextNode.value,
+      getAtmosphere: () => atmosphereContext,
+      getClouds: () => cloudsContext,
+      getCloudsShadow: useCloudShadowAtlas
+        ? () => cloudsShadowNode
+        : undefined,
+      getCloudsShadowLength: useCloudShadowLength
+        ? () => shadowLengthNode
+        : undefined
+    })
+  }, [
+    renderer,
+    atmosphereContext,
+    cloudsContext,
+    cloudsShadowNode,
+    shadowLengthNode,
+    useCloudShadowAtlas,
+    useCloudShadowLength
+  ])
+
+  const enableWebGLLightingModel =
+    alignWithWebGLLightingModel && !debugDisableAerialLighting
 
   const aerialInputNode = useResource(
     () =>
@@ -535,25 +548,48 @@ const Content: FC<StoryProps> = ({
   )
 
   const aerialNode = useResource(
-    () => aerialPerspective(aerialInputNode, depthNode, normalNode),
-    [aerialInputNode, depthNode, normalNode]
+    () =>
+      aerialPerspective(
+        aerialInputNode,
+        depthNode,
+        useCloudShadowLength
+          ? vec2(shadowLengthNode.sampleShadowLength(viewportUV), 0)
+          : null
+      ),
+    [
+      aerialInputNode,
+      cloudsShadowNode,
+      shadowLengthNode,
+      depthNode,
+      useCloudShadowLength,
+      normalNode
+    ]
   )
 
-  const cloudNode = useResource(
-    () => {
-      cloudsContext.temporalUpscale = temporalUpscale
-      return clouds(aerialNode, depthNode, camera)
-    },
-    [aerialNode, camera, cloudsContext, depthNode, taaEnabled, temporalUpscale]
-  )
-  const lensFlareNode = useResource(
-    () => lensFlare(cloudNode),
-    [cloudNode]
-  )
+  const cloudNode = useResource(() => {
+    cloudsContext.temporalUpscale = temporalUpscale
+    return clouds(aerialNode, depthNode, camera)
+  }, [
+    aerialNode,
+    camera,
+    cloudsContext,
+    cloudsShadowNode,
+    shadowLengthNode,
+    depthNode,
+    useCloudShadowAtlas,
+    useCloudShadowLength,
+    taaEnabled,
+    temporalUpscale
+  ])
+  const lensFlareNode = useResource(() => lensFlare(cloudNode), [cloudNode])
 
   const toneMappingNode = useResource(
     () => toneMapping(AgXToneMapping, uniform(1), lensFlareNode),
     [lensFlareNode]
+  )
+  const ditherNode = useMemo(
+    () => (useStableHighOrbitParity ? stationaryDithering : dithering),
+    [useStableHighOrbitParity]
   )
 
   const overlayPassNode = useResource(
@@ -565,23 +601,50 @@ const Content: FC<StoryProps> = ({
     [camera, overlayScene]
   )
 
-  const postProcessing = useResource(
+  const finalNode = useResource(
     () =>
-      new PostProcessing(
-        renderer,
-        toneMappingNode
-          .add(dithering)
-          .mul(overlayPassNode.a.oneMinus())
-          .add(overlayPassNode)
-      ),
-    [renderer, toneMappingNode, overlayPassNode]
+      toneMappingNode
+        .add(ditherNode)
+        .mul(overlayPassNode.a.oneMinus())
+        .add(overlayPassNode),
+    [toneMappingNode, overlayPassNode, ditherNode]
+  )
+
+  const postProcessing = useResource(
+    () => {
+      const outputNode =
+        debugRenderStage === 'base'
+          ? colorNode
+          : debugRenderStage === 'aerial'
+            ? aerialNode
+            : debugRenderStage === 'cloud'
+              ? cloudNode
+              : finalNode
+      return new RenderPipeline(renderer, outputNode)
+    },
+    [
+      renderer,
+      colorNode,
+      aerialNode,
+      cloudNode,
+      finalNode,
+      debugRenderStage
+    ]
   )
 
   useLayoutEffect(() => {
     aerialNode.lighting = enableWebGLLightingModel
-    aerialNode.correctGeometricError = true
+    aerialNode.correctGeometricError = !debugDisableGeometricCorrection
+    aerialNode.normalNode = debugDisableAerialNormal ? null : normalNode
     postProcessing.needsUpdate = true
-  }, [aerialNode, enableWebGLLightingModel, postProcessing])
+  }, [
+    aerialNode,
+    debugDisableAerialNormal,
+    debugDisableGeometricCorrection,
+    enableWebGLLightingModel,
+    normalNode,
+    postProcessing
+  ])
 
   useGuardedFrame(() => {
     postProcessing.render()
@@ -610,11 +673,9 @@ const Content: FC<StoryProps> = ({
     }
 
     new PointOfView(distance, radians(heading), radians(pitch)).decompose(
-      new Geodetic(
-        radians(longitude),
-        radians(latitude),
-        height ?? 0
-      ).toECEF(targetScratch),
+      new Geodetic(radians(longitude), radians(latitude), height ?? 0).toECEF(
+        targetScratch
+      ),
       camera.position,
       camera.quaternion,
       camera.up
@@ -646,19 +707,20 @@ const Content: FC<StoryProps> = ({
     const ecefToWorld = matrixScratch
       .copy(atmosphereContext.matrixWorldToECEF.value)
       .invert()
-    const targetWorld = targetWorldScratch.copy(targetECEF).applyMatrix4(
-      ecefToWorld
-    )
+    const targetWorld = targetWorldScratch
+      .copy(targetECEF)
+      .applyMatrix4(ecefToWorld)
     new PointOfView(distance, radians(heading), radians(pitch)).decompose(
       targetECEF,
       eyeScratch,
       pointOfViewQuaternionScratch,
       upScratch
     )
-    const cameraWorld = cameraWorldScratch.copy(eyeScratch).applyMatrix4(
-      ecefToWorld
-    )
-    const upWorld = worldUpScratch.copy(upScratch)
+    const cameraWorld = cameraWorldScratch
+      .copy(eyeScratch)
+      .applyMatrix4(ecefToWorld)
+    const upWorld = worldUpScratch
+      .copy(upScratch)
       .transformDirection(ecefToWorld)
       .normalize()
 
@@ -782,35 +844,84 @@ const Content: FC<StoryProps> = ({
     }
   }, 2)
 
+  const updateAtmosphereDate = useCallback(
+    (date: number) => {
+      const { matrixECIToECEF, sunDirectionECEF, moonDirectionECEF } =
+        atmosphereContext
+      getECIToECEFRotationMatrix(date, matrixECIToECEF.value)
+      getSunDirectionECI(date, sunDirectionECEF.value).applyMatrix4(
+        matrixECIToECEF.value
+      )
+      getMoonDirectionECI(date, moonDirectionECEF.value).applyMatrix4(
+        matrixECIToECEF.value
+      )
+    },
+    [atmosphereContext]
+  )
+
   useLocalDateControls(longitude, date => {
-    const { matrixECIToECEF, sunDirectionECEF, moonDirectionECEF } =
-      atmosphereContext
-    getECIToECEFRotationMatrix(date, matrixECIToECEF.value)
-    getSunDirectionECI(date, sunDirectionECEF.value).applyMatrix4(
-      matrixECIToECEF.value
-    )
-    getMoonDirectionECI(date, moonDirectionECEF.value).applyMatrix4(
-      matrixECIToECEF.value
-    )
+    if (debugFreezeLocalDate) {
+      return
+    }
+    updateAtmosphereDate(date)
   })
+
+  useLayoutEffect(() => {
+    if (!debugFreezeLocalDate) {
+      return
+    }
+    const epoch = Date.UTC(debugYear, 0, 1, 0, 0, 0, 0)
+    const offset = longitude / 15
+    updateAtmosphereDate(
+      epoch +
+        ((Math.floor(debugDayOfYear) - 1) * 24 +
+          debugTimeOfDay -
+          offset) *
+          3600000
+    )
+  }, [
+    debugDayOfYear,
+    debugFreezeLocalDate,
+    debugTimeOfDay,
+    debugYear,
+    longitude,
+    updateAtmosphereDate
+  ])
+
+  const cloudsProvider = (
+    <WebGPUCloudsContext
+      context={cloudsContext}
+      localWeatherTexture={localWeatherUrl}
+      shapeTexture={shapeUrl}
+      shapeDetailTexture={shapeDetailUrl}
+      turbulenceTexture={turbulenceUrl}
+      stbnTexture={stbnUrl}
+    />
+  )
 
   if (apiKey == null || disableTiles) {
     if (alignWithWebGLBasic || disableFallbackEllipsoid) {
-      return null
+      return <>{cloudsProvider}</>
     }
     return (
-      <EllipsoidMesh
-        ref={ellipsoidRef}
-        args={[Ellipsoid.WGS84.radii, 192, 96]}
-        material={fallbackGlobeMaterial}
-      />
+      <>
+        {cloudsProvider}
+        <EllipsoidMesh
+          ref={ellipsoidRef}
+          args={[Ellipsoid.WGS84.radii, 192, 96]}
+          material={fallbackGlobeMaterial}
+        />
+      </>
     )
   }
 
   return (
-    <Globe apiKey={apiKey}>
-      <GlobeControls enableDamping overlayScene={overlayScene} />
-    </Globe>
+    <>
+      {cloudsProvider}
+      <Globe apiKey={apiKey}>
+        <GlobeControls enableDamping overlayScene={overlayScene} />
+      </Globe>
+    </>
   )
 }
 
@@ -818,7 +929,7 @@ export const Story: StoryFC<StoryProps, StoryArgs> = props => (
   <WebGPUCanvas
     camera={{
       near: 1,
-      far: 4e7
+      far: props.cameraFar ?? 4e7
     }}
     renderer={{
       logarithmicDepthBuffer: true
@@ -846,8 +957,8 @@ export const Story: StoryFC<StoryProps, StoryArgs> = props => (
           implementation).
         </p>
         <p>
-          Google Photorealistic 3D Tiles require a valid Google Maps API key only
-          when tiles are enabled. If the terrain does not appear, provide{' '}
+          Google Photorealistic 3D Tiles require a valid Google Maps API key
+          only when tiles are enabled. If the terrain does not appear, provide{' '}
           <code>google maps api key</code> from the controls panel or configure{' '}
           <code>STORYBOOK_GOOGLE_MAP_API_KEY</code>.
         </p>
@@ -868,6 +979,10 @@ Story.args = {
   qualityPreset: 'high',
   resolutionScale: 1,
   taaEnabled: true,
+  discardAllHistory: false,
+  velocityThresholdPixels: 6,
+  historyResetDistanceThreshold: 100,
+  temporalAlpha: -1,
   temporalUpscale: false,
   temporalUpscaleScale: 0.375,
   animateClouds: false,
@@ -875,6 +990,11 @@ Story.args = {
   shapeDetail: true,
   turbulence: true,
   haze: true,
+  debugRenderStage: 'final',
+  debugDisableAerialLighting: false,
+  debugDisableGeometricCorrection: false,
+  debugDisableAerialNormal: false,
+  debugFreezeLocalDate: false,
   ...localDateArgs({
     dayOfYear: 260,
     timeOfDay: 16
@@ -924,6 +1044,43 @@ Story.argTypes = {
     name: 'taa enabled',
     control: {
       type: 'boolean'
+    },
+    table: { category: 'rendering' }
+  },
+  discardAllHistory: {
+    name: 'discard all history',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'rendering' }
+  },
+  velocityThresholdPixels: {
+    name: 'velocity threshold (px)',
+    control: {
+      type: 'range',
+      min: 0,
+      max: 24,
+      step: 0.25
+    },
+    table: { category: 'rendering' }
+  },
+  historyResetDistanceThreshold: {
+    name: 'history reset distance (m)',
+    control: {
+      type: 'range',
+      min: 0,
+      max: 5000,
+      step: 10
+    },
+    table: { category: 'rendering' }
+  },
+  temporalAlpha: {
+    name: 'temporal alpha (-1 auto)',
+    control: {
+      type: 'range',
+      min: -1,
+      max: 1,
+      step: 0.01
     },
     table: { category: 'rendering' }
   },
@@ -979,6 +1136,42 @@ Story.argTypes = {
       type: 'boolean'
     },
     table: { category: 'rendering' }
+  },
+  debugRenderStage: {
+    name: 'debug render stage',
+    control: {
+      type: 'select'
+    },
+    options: ['final', 'base', 'aerial', 'cloud'] satisfies DebugRenderStage[],
+    table: { category: 'debug' }
+  },
+  debugDisableAerialLighting: {
+    name: 'disable aerial lighting',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugDisableGeometricCorrection: {
+    name: 'disable geometric correction',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugDisableAerialNormal: {
+    name: 'disable aerial normal',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugFreezeLocalDate: {
+    name: 'freeze local date',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
   },
   ...localDateArgTypes(),
   ...toneMappingArgTypes(),

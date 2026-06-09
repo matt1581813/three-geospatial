@@ -57,15 +57,7 @@ export const FUJI_NO_TILES_EFFECT_OPTIONS = {
   groundBounceScale: 0.6
 } as const
 
-/**
- * Applies the shared Fuji no-tiles cloud preset to a mutable clouds target.
- *
- * @param target - WebGL `CloudsEffect` or WebGPU `CloudsContext`-like object
- *   that exposes the shared cloud parameter surface.
- * @returns Nothing. The target object is mutated in place.
- */
-export function applyFujiNoTilesCloudPreset(target: {
-  cloudLayers: CloudLayers
+interface FujiNoTilesCloudParameterTarget {
   localWeatherRepeat: { setScalar: (value: number) => unknown }
   localWeatherOffset: {
     x: number
@@ -83,12 +75,20 @@ export function applyFujiNoTilesCloudPreset(target: {
   absorptionCoefficient: number
   skyLightScale: number
   groundBounceScale: number
-}): void {
-  target.cloudLayers.copy(CloudLayers.DEFAULT)
-  target.cloudLayers[0].set(FUJI_NO_TILES_LAYER_OPTIONS[0])
-  target.cloudLayers[1].set(FUJI_NO_TILES_LAYER_OPTIONS[1])
-  target.cloudLayers[2].set(FUJI_NO_TILES_LAYER_OPTIONS[2])
+}
 
+export function applyFujiNoTilesCloudLayerPreset(
+  target: CloudLayers
+): void {
+  target.copy(CloudLayers.DEFAULT)
+  target[0].set(FUJI_NO_TILES_LAYER_OPTIONS[0])
+  target[1].set(FUJI_NO_TILES_LAYER_OPTIONS[1])
+  target[2].set(FUJI_NO_TILES_LAYER_OPTIONS[2])
+}
+
+export function applyFujiNoTilesCloudParameterPreset(
+  target: FujiNoTilesCloudParameterTarget
+): void {
   const [weatherOffsetX, weatherOffsetY] =
     FUJI_NO_TILES_LOCAL_WEATHER_OFFSETS[
       FUJI_NO_TILES_LOCAL_WEATHER_OFFSET_INDEX
@@ -111,4 +111,18 @@ export function applyFujiNoTilesCloudPreset(target: {
     FUJI_NO_TILES_EFFECT_OPTIONS.absorptionCoefficient
   target.skyLightScale = FUJI_NO_TILES_EFFECT_OPTIONS.skyLightScale
   target.groundBounceScale = FUJI_NO_TILES_EFFECT_OPTIONS.groundBounceScale
+}
+
+/**
+ * Applies the shared Fuji no-tiles cloud preset to a mutable clouds target.
+ *
+ * @param target - WebGL `CloudsEffect` or WebGPU `CloudsContext`-like object
+ *   that exposes the shared cloud parameter surface.
+ * @returns Nothing. The target object is mutated in place.
+ */
+export function applyFujiNoTilesCloudPreset(target: {
+  cloudLayers: CloudLayers
+} & FujiNoTilesCloudParameterTarget): void {
+  applyFujiNoTilesCloudLayerPreset(target.cloudLayers)
+  applyFujiNoTilesCloudParameterPreset(target)
 }

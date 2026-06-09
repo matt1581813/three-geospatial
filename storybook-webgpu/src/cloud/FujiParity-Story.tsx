@@ -1,9 +1,5 @@
 import { OrbitControls } from '@react-three/drei'
-import {
-  Canvas,
-  useFrame,
-  useThree,
-} from '@react-three/fiber'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { EffectComposer, SMAA, ToneMapping } from '@react-three/postprocessing'
 import type { GlobeControls as GlobeControlsImpl } from '3d-tiles-renderer'
 import {
@@ -19,6 +15,7 @@ import {
   TilesPlugin,
   TilesRenderer
 } from '3d-tiles-renderer/r3f'
+import { ToneMappingMode } from 'postprocessing'
 import {
   Fragment,
   useCallback,
@@ -26,6 +23,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentRef,
   type FC,
   type ReactNode
 } from 'react'
@@ -42,19 +40,31 @@ import {
   type ToneMapping as ThreeToneMapping
 } from 'three'
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js'
-import { ToneMappingMode } from 'postprocessing'
 
 import {
   AerialPerspective,
   Atmosphere,
   type AtmosphereApi
 } from '@takram/three-atmosphere/r3f'
-import type { CloudsQualityPreset } from '@takram/three-clouds'
-import { Clouds } from '@takram/three-clouds/r3f'
-import { Ellipsoid, Geodetic, PointOfView, radians } from '@takram/three-geospatial'
-import { EllipsoidMesh } from '@takram/three-geospatial/r3f'
+import {
+  CloudLayers,
+  type CloudsQualityPreset
+} from '@takram/three-clouds'
+import { CloudLayer, Clouds } from '@takram/three-clouds/r3f'
+import {
+  Ellipsoid,
+  Geodetic,
+  PointOfView,
+  radians
+} from '@takram/three-geospatial'
 import { Dithering, LensFlare } from '@takram/three-geospatial-effects/r3f'
+import { EllipsoidMesh } from '@takram/three-geospatial/r3f'
 
+import localWeatherUrl from '../../../packages/clouds/assets/local_weather.png?url'
+import shapeDetailUrl from '../../../packages/clouds/assets/shape_detail.bin?url'
+import shapeUrl from '../../../packages/clouds/assets/shape.bin?url'
+import turbulenceUrl from '../../../packages/clouds/assets/turbulence.png?url'
+import stbnUrl from '../../../packages/core/assets/stbn.bin?url'
 import type { StoryFC } from '../components/createStory'
 import { Stats } from '../components/Stats'
 import {
@@ -63,20 +73,27 @@ import {
   useLocalDateControls,
   type LocalDateArgs
 } from '../controls/localDateControls'
-import { rendererArgs, rendererArgTypes, type RendererArgs } from '../controls/rendererControls'
+import {
+  outputPassArgs,
+  outputPassArgTypes,
+  type OutputPassArgs
+} from '../controls/outputPassControls'
+import {
+  rendererArgs,
+  rendererArgTypes,
+  type RendererArgs
+} from '../controls/rendererControls'
 import {
   toneMappingArgs,
   toneMappingArgTypes,
   type ToneMappingArgs
 } from '../controls/toneMappingControls'
-import { useControl } from '../hooks/useControl'
-import type { PointOfViewProps } from '../hooks/usePointOfView'
 import {
   applyCameraMatrixToCamera,
   cameraMatricesApproximatelyEqual,
   readCameraFromUrl,
-  serializeCameraComponents,
   readCameraMatrixFromUrl,
+  serializeCameraComponents,
   serializeCameraMatrixElements,
   writeCameraToUrl
 } from '../helpers/cameraMatrixURL'
@@ -85,16 +102,25 @@ import {
   pointOfViewsApproximatelyEqual,
   readPointOfViewFromCamera
 } from '../helpers/cameraPointOfView'
+import { useControl } from '../hooks/useControl'
+import type { PointOfViewProps } from '../hooks/usePointOfView'
 import { Story as WebGPUCloudStory } from './Cloud-Story'
 import {
   FUJI_PARITY_ANCHOR_LATITUDE,
-  FUJI_PARITY_ANCHOR_LONGITUDE
+  FUJI_PARITY_ANCHOR_LONGITUDE,
+  FUJI_NO_TILES_LAYER_OPTIONS,
+  applyFujiNoTilesCloudParameterPreset
 } from './fujiParityPreset'
 
 type Backend = 'webgpu' | 'webgl'
 type CloudPresetMode = 'legacy-default' | 'fuji-no-tiles'
+type DebugRenderStage = 'final' | 'base' | 'aerial' | 'cloud'
 
-interface FujiParityArgs extends LocalDateArgs, ToneMappingArgs, RendererArgs {
+interface FujiParityArgs
+  extends LocalDateArgs,
+    ToneMappingArgs,
+    RendererArgs,
+    OutputPassArgs {
   backend: Backend
   googleMapsApiKey: string
   cloudPresetMode: CloudPresetMode
@@ -103,6 +129,10 @@ interface FujiParityArgs extends LocalDateArgs, ToneMappingArgs, RendererArgs {
   qualityPreset: CloudsQualityPreset
   resolutionScale: number
   taaEnabled: boolean
+  discardAllHistory: boolean
+  velocityThresholdPixels: number
+  historyResetDistanceThreshold: number
+  temporalAlpha: number
   temporalUpscale: boolean
   temporalUpscaleScale: number
   animateClouds: boolean
@@ -110,6 +140,14 @@ interface FujiParityArgs extends LocalDateArgs, ToneMappingArgs, RendererArgs {
   shapeDetail: boolean
   turbulence: boolean
   haze: boolean
+  debugRenderStage?: DebugRenderStage
+  debugDisableOrbitControls?: boolean
+  debugDisableCameraFeedback?: boolean
+  debugDisableCloudShadowAtlas?: boolean
+  debugDisableAerialLighting?: boolean
+  debugDisableGeometricCorrection?: boolean
+  debugDisableAerialNormal?: boolean
+  debugFreezeLocalDate?: boolean
 }
 
 const LOCAL_WEATHER_VELOCITY = [0.001, 0] as const
@@ -146,14 +184,24 @@ function getFujiTargetWorld(
     height
   ).toECEF(new Vector3())
 
-  return targetECEF
-    .applyMatrix4(worldToECEFMatrix.invert())
+  return targetECEF.applyMatrix4(worldToECEFMatrix.invert()).toArray() as [
+    number,
+    number,
+    number
+  ]
+}
+
+function getFujiTargetECEF(
+  longitude: number,
+  latitude: number,
+  height = 0
+): [number, number, number] {
+  return new Geodetic(radians(longitude), radians(latitude), height)
+    .toECEF(new Vector3())
     .toArray() as [number, number, number]
 }
 
-function mapThreeToneMappingMode(
-  value: ThreeToneMapping
-): ToneMappingMode {
+function mapThreeToneMappingMode(value: ThreeToneMapping): ToneMappingMode {
   switch (value) {
     case LinearToneMapping:
       return ToneMappingMode.LINEAR
@@ -286,6 +334,7 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
   const camera = useThree(({ camera }) => camera)
   const renderer = useThree(({ gl }) => gl)
   const atmosphereRef = useRef<AtmosphereApi>(null)
+  const cloudsRef = useRef<ComponentRef<typeof Clouds>>(null)
   const apiKey = useControl(({ googleMapsApiKey }: FujiParityArgs) =>
     googleMapsApiKey !== '' ? googleMapsApiKey : undefined
   )
@@ -307,10 +356,10 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
     ({ temporalUpscaleScale }: FujiParityArgs) => temporalUpscaleScale
   )
   const toneMappingEnabled = useControl(
-    ({ toneMappingEnabled }: FujiParityArgs) => toneMappingEnabled
-  )
-  const toneMapping = useControl(
     ({ toneMapping }: FujiParityArgs) => toneMapping
+  )
+  const toneMappingMode = useControl(
+    ({ toneMappingMode }: FujiParityArgs) => toneMappingMode
   )
   const toneMappingExposure = useControl(
     ({ toneMappingExposure }: FujiParityArgs) => toneMappingExposure
@@ -318,10 +367,26 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
   const shapeDetail = useControl(
     ({ shapeDetail }: FujiParityArgs) => shapeDetail
   )
-  const turbulence = useControl(
-    ({ turbulence }: FujiParityArgs) => turbulence
-  )
+  const turbulence = useControl(({ turbulence }: FujiParityArgs) => turbulence)
   const haze = useControl(({ haze }: FujiParityArgs) => haze)
+  const cloudPresetMode = useCloudPresetMode()
+  const applyCloudPresetParameters = useCallback(
+    (clouds: ComponentRef<typeof Clouds>): void => {
+      if (cloudPresetMode === 'fuji-no-tiles') {
+        applyFujiNoTilesCloudParameterPreset(clouds)
+      }
+    },
+    [cloudPresetMode]
+  )
+  const handleCloudsRef = useCallback(
+    (clouds: ComponentRef<typeof Clouds> | null): void => {
+      cloudsRef.current = clouds
+      if (clouds != null) {
+        applyCloudPresetParameters(clouds)
+      }
+    },
+    [applyCloudPresetParameters]
+  )
 
   const cloudMotionScale = useCloudMotionScale()
   const localWeatherVelocity = useCloudVelocity2(cloudMotionScale)
@@ -340,7 +405,9 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
         radians(cameraComponents?.[0] ?? longitude),
         radians(cameraComponents?.[1] ?? latitude),
         cameraComponents?.[2] ?? height
-      ).toECEF(new Vector3()).toArray() as [number, number, number],
+      )
+        .toECEF(new Vector3())
+        .toArray() as [number, number, number],
     [cameraComponents, height, latitude, longitude]
   )
 
@@ -355,12 +422,18 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
   }, [renderer, toneMappingExposure])
 
   useLayoutEffect(() => {
+    const clouds = cloudsRef.current
+    if (clouds == null) {
+      return
+    }
+    applyCloudPresetParameters(clouds)
+  }, [applyCloudPresetParameters, qualityPreset])
+
+  useLayoutEffect(() => {
     new PointOfView(distance, radians(heading), radians(pitch)).decompose(
-      new Geodetic(
-        radians(longitude),
-        radians(latitude),
-        height
-      ).toECEF(targetScratch),
+      new Geodetic(radians(longitude), radians(latitude), height).toECEF(
+        targetScratch
+      ),
       camera.position,
       camera.quaternion,
       camera.up
@@ -444,11 +517,13 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
             shapeDetail,
             turbulence,
             haze,
+            cloudPresetMode,
             toneMappingEnabled,
-            toneMapping
+            toneMappingMode
           ])}
         >
           <Clouds
+            ref={handleCloudsRef}
             shadow-farScale={0.25}
             coverage={coverage}
             qualityPreset={qualityPreset}
@@ -460,7 +535,24 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
             localWeatherVelocity={localWeatherVelocity}
             shapeVelocity={shapeVelocity}
             shapeDetailVelocity={shapeDetailVelocity}
-          />
+            disableDefaultLayers={cloudPresetMode === 'fuji-no-tiles'}
+            localWeatherTexture={localWeatherUrl}
+            shapeTexture={shapeUrl}
+            shapeDetailTexture={shapeDetailUrl}
+            turbulenceTexture={turbulenceUrl}
+            stbnTexture={stbnUrl}
+          >
+            {cloudPresetMode === 'fuji-no-tiles' &&
+              FUJI_NO_TILES_LAYER_OPTIONS.map((layer, index) => (
+                <CloudLayer
+                  key={index}
+                  index={index}
+                  channel={CloudLayers.DEFAULT[index].channel}
+                  shadow={CloudLayers.DEFAULT[index].shadow}
+                  {...layer}
+                />
+              ))}
+          </Clouds>
           <AerialPerspective
             sky
             sunLight
@@ -471,7 +563,7 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
           {toneMappingEnabled && (
             <>
               <LensFlare />
-              <ToneMapping mode={mapThreeToneMappingMode(toneMapping)} />
+              <ToneMapping mode={mapThreeToneMappingMode(toneMappingMode)} />
               <SMAA />
               <Dithering />
             </>
@@ -484,8 +576,9 @@ const LegacyWebGLFujiScene: FC<PointOfViewProps & FujiCameraSyncProps> = ({
 
 const StableLegacyCanvas: FC<{
   pixelRatio: number
+  cameraFar: number
   children: ReactNode
-}> = ({ pixelRatio, children }) => {
+}> = ({ pixelRatio, cameraFar, children }) => {
   const [hostElement, setHostElement] = useState<HTMLDivElement | null>(null)
   const handleHostRef = useCallback((node: HTMLDivElement | null) => {
     setHostElement(current => (current === node ? current : node))
@@ -506,8 +599,9 @@ const StableLegacyCanvas: FC<{
           eventSource={hostElement}
           gl={{ depth: false }}
           dpr={pixelRatio}
-          camera={{ near: 1, far: 4e5, up: WORLD_UP.toArray() }}
+          camera={{ near: 1, far: cameraFar, up: WORLD_UP.toArray() }}
         >
+          <CameraFarSync cameraFar={cameraFar} />
           {children}
         </Canvas>
       )}
@@ -515,11 +609,82 @@ const StableLegacyCanvas: FC<{
   )
 }
 
-const WebGLFujiStory: FC<PointOfViewProps & FujiCameraSyncProps> = props => {
+/**
+ * Keeps the active R3F camera projection in sync after URL camera changes.
+ *
+ * @param props Contains the desired far clipping distance.
+ * @returns Nothing; updates the active camera projection in-place.
+ */
+const CameraFarSync: FC<{ cameraFar: number }> = ({ cameraFar }) => {
+  const camera = useThree(({ camera }) => camera)
+
+  useLayoutEffect(() => {
+    const cameraWithProjection = camera as typeof camera & {
+      far: number
+      updateProjectionMatrix: () => void
+    }
+    if (cameraWithProjection.far === cameraFar) {
+      return
+    }
+    cameraWithProjection.far = cameraFar
+    cameraWithProjection.updateProjectionMatrix()
+  }, [camera, cameraFar])
+
+  return null
+}
+
+/**
+ * Measures camera distance from URL matrix elements when point-of-view values
+ * are not available.
+ *
+ * @param cameraMatrixElements Matrix-world elements from the URL.
+ * @param orbitTarget Current orbit target in the same world frame.
+ * @returns Distance in meters when the matrix is usable; otherwise null.
+ */
+const getCameraMatrixDistance = (
+  cameraMatrixElements: number[] | null,
+  orbitTarget: [number, number, number]
+): number | null => {
+  if (cameraMatrixElements == null || cameraMatrixElements.length !== 16) {
+    return null
+  }
+  const distance = Math.hypot(
+    cameraMatrixElements[12] - orbitTarget[0],
+    cameraMatrixElements[13] - orbitTarget[1],
+    cameraMatrixElements[14] - orbitTarget[2]
+  )
+  return Number.isFinite(distance) && distance > 0 ? distance : null
+}
+
+/**
+ * Resolves a far clipping distance large enough for low altitude and LEO views.
+ *
+ * @param cameraComponents Point-of-view URL components when available.
+ * @param cameraMatrixElements Matrix-world URL components when available.
+ * @param distance Story control fallback camera distance.
+ * @param orbitTarget Current orbit target in the active world frame.
+ * @returns Far clipping distance shared by WebGL and WebGPU canvases.
+ */
+const getFujiParityCameraFar = (
+  cameraComponents: number[] | null,
+  cameraMatrixElements: number[] | null,
+  distance: number,
+  orbitTarget: [number, number, number]
+): number => {
+  const cameraDistance =
+    cameraComponents?.[5] ??
+    getCameraMatrixDistance(cameraMatrixElements, orbitTarget) ??
+    distance
+  return Math.max(4e5, cameraDistance * 4)
+}
+
+const WebGLFujiStory: FC<
+  PointOfViewProps & FujiCameraSyncProps & { cameraFar: number }
+> = ({ cameraFar, ...props }) => {
   const pixelRatio = useControl(({ pixelRatio }: FujiParityArgs) => pixelRatio)
 
   return (
-    <StableLegacyCanvas pixelRatio={pixelRatio}>
+    <StableLegacyCanvas pixelRatio={pixelRatio} cameraFar={cameraFar}>
       <LegacyWebGLFujiScene {...props} />
       <Stats />
     </StableLegacyCanvas>
@@ -534,14 +699,31 @@ const WebGLFujiStory: FC<PointOfViewProps & FujiCameraSyncProps> = props => {
  */
 export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
   const backend = useControl(({ backend }: FujiParityArgs) => backend)
+  const debugDisableOrbitControls = useControl(
+    ({ debugDisableOrbitControls = false }: FujiParityArgs) =>
+      debugDisableOrbitControls
+  )
+  const debugDisableCameraFeedback = useControl(
+    ({ debugDisableCameraFeedback = false }: FujiParityArgs) =>
+      debugDisableCameraFeedback
+  )
+  const debugDisableCloudShadowAtlas = useControl(
+    ({ debugDisableCloudShadowAtlas = false }: FujiParityArgs) =>
+      debugDisableCloudShadowAtlas
+  )
   const cloudPresetMode = useCloudPresetMode()
+  const useFujiNoTilesPreset = cloudPresetMode === 'fuji-no-tiles'
+  const useWebglLikeMarchBudget = true
+  const useIdentityWorldFrame = cloudPresetMode === 'legacy-default'
   const [cameraComponents, setCameraComponents] = useState<number[] | null>(
     () => readCameraFromUrl()
   )
-  const [cameraMatrixElements, setCameraMatrixElements] = useState<number[] | null>(
-    () => readCameraMatrixFromUrl()
+  const [cameraMatrixElements, setCameraMatrixElements] = useState<
+    number[] | null
+  >(() => readCameraMatrixFromUrl())
+  const [resolvedBackend, setResolvedBackend] = useState<Backend | null>(
+    backend
   )
-  const [resolvedBackend, setResolvedBackend] = useState<Backend | null>(backend)
   const pendingBackendRef = useRef<Backend | null>(null)
   const lastCameraMatrixSignatureRef = useRef(
     cameraMatrixElements != null
@@ -551,14 +733,29 @@ export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
   const lastCameraComponentsSignatureRef = useRef(
     cameraComponents != null ? serializeCameraComponents(cameraComponents) : ''
   )
-  const orbitTarget = useMemo(
+  const orbitTarget = useMemo(() => {
+    const longitude = cameraComponents?.[0] ?? props.longitude
+    const latitude = cameraComponents?.[1] ?? props.latitude
+    const height = cameraComponents?.[2] ?? props.height ?? 0
+    return useIdentityWorldFrame
+      ? getFujiTargetECEF(longitude, latitude, height)
+      : getFujiTargetWorld(longitude, latitude, height)
+  }, [
+    cameraComponents,
+    props.height,
+    props.latitude,
+    props.longitude,
+    useIdentityWorldFrame
+  ])
+  const cameraFar = useMemo(
     () =>
-      getFujiTargetWorld(
-        cameraComponents?.[0] ?? props.longitude,
-        cameraComponents?.[1] ?? props.latitude,
-        cameraComponents?.[2] ?? props.height ?? 0
+      getFujiParityCameraFar(
+        cameraComponents,
+        cameraMatrixElements,
+        props.distance,
+        orbitTarget
       ),
-    [cameraComponents, props.height, props.latitude, props.longitude]
+    [cameraComponents, cameraMatrixElements, orbitTarget, props.distance]
   )
   const handleCameraComponentsChange = useCallback((components: number[]) => {
     if (components.length !== 6) {
@@ -596,11 +793,11 @@ export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
   }, [])
 
   useLayoutEffect(() => {
-    if (cameraComponents == null) {
+    if (debugDisableCameraFeedback || cameraComponents == null) {
       return
     }
     writeCameraToUrl(cameraComponents)
-  }, [cameraComponents, resolvedBackend])
+  }, [cameraComponents, debugDisableCameraFeedback, resolvedBackend])
 
   useLayoutEffect(() => {
     if (backend === resolvedBackend || pendingBackendRef.current === backend) {
@@ -631,8 +828,13 @@ export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
         {...props}
         cameraMatrixElements={cameraMatrixElements}
         cameraComponents={cameraComponents}
-        onCameraMatrixChange={handleCameraMatrixChange}
-        onCameraComponentsChange={handleCameraComponentsChange}
+        cameraFar={cameraFar}
+        onCameraMatrixChange={
+          debugDisableCameraFeedback ? undefined : handleCameraMatrixChange
+        }
+        onCameraComponentsChange={
+          debugDisableCameraFeedback ? undefined : handleCameraComponentsChange
+        }
       />
     )
   }
@@ -643,18 +845,26 @@ export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
       {...props}
       disableTiles
       disableCloudStoryPreset
-      useFujiNoTilesCloudPreset={cloudPresetMode === 'fuji-no-tiles'}
-      forceWebglLikeMarchBudget={cloudPresetMode === 'legacy-default'}
+      useFujiNoTilesCloudPreset={useFujiNoTilesPreset}
+      forceWebglLikeMarchBudget={useWebglLikeMarchBudget}
       disableFallbackNoApiKeyCameraOverride
-      useIdentityWorldToECEFFrame={false}
+      useIdentityWorldToECEFFrame={useIdentityWorldFrame}
       alignWithWebGLLightingModel
+      enableCloudShadowAtlas={
+        useFujiNoTilesPreset && !debugDisableCloudShadowAtlas
+      }
       updateArgs={() => undefined}
-      enableOrbitControls
+      enableOrbitControls={!debugDisableOrbitControls}
       orbitControlsTarget={orbitTarget}
+      cameraFar={cameraFar}
       cameraMatrixElements={cameraMatrixElements}
       cameraComponents={cameraComponents}
-      onCameraMatrixChange={handleCameraMatrixChange}
-      onCameraComponentsChange={handleCameraComponentsChange}
+      onCameraMatrixChange={
+        debugDisableCameraFeedback ? undefined : handleCameraMatrixChange
+      }
+      onCameraComponentsChange={
+        debugDisableCameraFeedback ? undefined : handleCameraComponentsChange
+      }
       hideDescription
     />
   )
@@ -663,12 +873,16 @@ export const Story: StoryFC<PointOfViewProps, FujiParityArgs> = props => {
 Story.args = {
   backend: 'webgpu',
   googleMapsApiKey: '',
-  cloudPresetMode: 'legacy-default',
+  cloudPresetMode: 'fuji-no-tiles',
   correctAltitude: true,
   coverage: 0.4,
   qualityPreset: 'high',
   resolutionScale: 1,
   taaEnabled: true,
+  discardAllHistory: false,
+  velocityThresholdPixels: 6,
+  historyResetDistanceThreshold: 100,
+  temporalAlpha: -1,
   temporalUpscale: false,
   temporalUpscaleScale: 0.375,
   animateClouds: true,
@@ -676,13 +890,23 @@ Story.args = {
   shapeDetail: true,
   turbulence: true,
   haze: true,
+  debugRenderStage: 'final',
+  debugDisableOrbitControls: false,
+  debugDisableCameraFeedback: false,
+  debugDisableCloudShadowAtlas: false,
+  debugDisableAerialLighting: false,
+  debugDisableGeometricCorrection: false,
+  debugDisableAerialNormal: false,
+  debugFreezeLocalDate: false,
   ...localDateArgs({
     dayOfYear: 200,
     timeOfDay: 17.5
   }),
   ...toneMappingArgs({
+    toneMappingMode: AgXToneMapping,
     toneMappingExposure: 10
   }),
+  ...outputPassArgs(),
   ...rendererArgs()
 }
 
@@ -746,6 +970,43 @@ Story.argTypes = {
     },
     table: { category: 'rendering' }
   },
+  discardAllHistory: {
+    name: 'discard all history',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'rendering' }
+  },
+  velocityThresholdPixels: {
+    name: 'velocity threshold (px)',
+    control: {
+      type: 'range',
+      min: 0,
+      max: 24,
+      step: 0.25
+    },
+    table: { category: 'rendering' }
+  },
+  historyResetDistanceThreshold: {
+    name: 'history reset distance (m)',
+    control: {
+      type: 'range',
+      min: 0,
+      max: 5000,
+      step: 10
+    },
+    table: { category: 'rendering' }
+  },
+  temporalAlpha: {
+    name: 'temporal alpha (-1 auto)',
+    control: {
+      type: 'range',
+      min: -1,
+      max: 1,
+      step: 0.01
+    },
+    table: { category: 'rendering' }
+  },
   temporalUpscale: {
     name: 'temporal upscale',
     control: {
@@ -799,8 +1060,69 @@ Story.argTypes = {
     },
     table: { category: 'rendering' }
   },
+  debugRenderStage: {
+    name: 'debug render stage',
+    control: {
+      type: 'select'
+    },
+    options: ['final', 'base', 'aerial', 'cloud'] satisfies DebugRenderStage[],
+    table: { category: 'debug' }
+  },
+  debugDisableOrbitControls: {
+    name: 'disable orbit controls',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugDisableCameraFeedback: {
+    name: 'disable camera feedback',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugDisableCloudShadowAtlas: {
+    name: 'disable cloud shadow atlas',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugDisableAerialLighting: {
+    name: 'disable aerial lighting',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugDisableGeometricCorrection: {
+    name: 'disable geometric correction',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugDisableAerialNormal: {
+    name: 'disable aerial normal',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
+  debugFreezeLocalDate: {
+    name: 'freeze local date',
+    control: {
+      type: 'boolean'
+    },
+    table: { category: 'debug' }
+  },
   ...localDateArgTypes(),
   ...toneMappingArgTypes(),
+  ...outputPassArgTypes({
+    hasNormal: true,
+    hasVelocity: true
+  }),
   ...rendererArgTypes()
 }
 

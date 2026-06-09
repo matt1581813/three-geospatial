@@ -39,7 +39,7 @@ import {
 } from 'three/tsl'
 import {
   MeshBasicNodeMaterial,
-  PostProcessing,
+  RenderPipeline,
   type Renderer
 } from 'three/webgpu'
 
@@ -534,7 +534,7 @@ const SceneContent: FC<StoryProps> = () => {
     [cloudsNode]
   )
   const postProcessing = useResource(
-    () => new PostProcessing(renderer, toneMappingNode),
+    () => new RenderPipeline(renderer, toneMappingNode),
     [renderer, toneMappingNode]
   )
 

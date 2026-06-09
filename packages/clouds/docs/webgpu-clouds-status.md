@@ -1,6 +1,6 @@
 # WebGPU Clouds Status
 
-Last updated: 2026-03-31
+Last updated: 2026-05-25
 
 This note records the current status of `@takram/three-clouds/webgpu` after the M1 acceptance pass and the M2 temporal-upscale acceptance pass.
 
@@ -282,3 +282,52 @@ The following items are not part of M1 and should not be used to block M1 accept
 - The following remain out of scope:
   - WebGPU procedural textures for clouds
   - `/webgpu/r3f` convenience wrappers
+
+## M3 Follow-up Stabilization
+
+### Accepted Stabilization Work
+
+- WebGPU clouds now expose and use the runtime controls needed for diagnosing
+  temporal history artifacts:
+  - `discardAllHistory`
+  - `velocityThresholdPixels`
+  - `historyResetDistanceThreshold`
+  - `temporalAlpha`
+- `TemporalAntialiasNode` now has a current-frame mask / history-confidence path
+  for cloud resolve stability. History confidence is biased by velocity and
+  depth agreement so fast camera motion and divergent depths rely less on stale
+  accumulation.
+- Camera-cut and resize reset behavior was kept aligned across the cloud body,
+  temporal-upscale, and shadow-length paths.
+- Shape and detail 3D texture sampling now clamps mip levels to avoid invalid
+  high-mip reads in the cloud volume path.
+- Cloud-layer sampling now guards active layer masks and layer height spans so
+  inactive or degenerate layers cannot produce invalid density intervals.
+- Shadow-length and horizon / ground-hit paths now clamp invalid negative or
+  behind-camera distances before they feed atmosphere and cloud lighting.
+- Fuji parity defaults now exercise the no-tiles WebGPU comparison path first,
+  with WebGL-compatible march budgets and shared camera URL synchronization.
+- Storybook WebGPU cloud stories now use `RenderPipeline` instead of deprecated
+  `PostProcessing` for Three r184 compatibility.
+- `@takram/three-clouds/webgpu/r3f` now exports a WebGPU `Clouds` context helper
+  and re-exports `CloudLayer`. The helper loads standard cloud textures, injects
+  `renderer.contextNode.getClouds()`, and leaves existing `CloudsContext`
+  layer presets untouched unless explicit `CloudLayer` children are supplied.
+
+### 2026-05-25 Browser Validation
+
+- Local Storybook dev server was validated at `http://127.0.0.1:4400/`.
+- Browser runtime validation covered:
+  - `cloud--fuji-parity` with `backend:webgpu`
+  - `clouds-webgpu-clouds--ground-temporal-upscale`
+  - `clouds-webgpu-cloud-shadows--ground-cloud-shadows`
+- All three stories reported `data-renderer-backend-resolved="webgpu"` and a
+  non-empty `1280 x 720` canvas.
+- Screenshot pixel statistics were non-flat for all validated stories, so the
+  tested canvases were not blank fallback surfaces.
+- Fuji parity orbit interaction was exercised by dragging the canvas. The camera
+  query parameter changed while the story stayed on the WebGPU backend.
+- No framework error overlay was detected.
+- No WebGPU runtime error was logged during the filtered validation windows.
+- Remaining console noise is the upstream `THREE.Clock` deprecation warning from
+  the React Three Fiber / Three integration path, not the clouds node pipeline.
