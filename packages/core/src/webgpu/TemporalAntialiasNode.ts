@@ -133,6 +133,7 @@ const clipAABB = /*#__PURE__*/ FnLayout({
   return maxUnit
     .greaterThan(1)
     .select(vec4(pClip, current.a).add(vClip.div(maxUnit)), history)
+    .uniformFlow()
 })
 
 const varianceOffsets = [
@@ -308,8 +309,8 @@ export class TemporalAntialiasNode extends TempNode {
 
   private readonly textureNode: TextureNode
 
-  private resolveRT = this.createRenderTarget('resolve')
-  private historyRT = this.createRenderTarget('history')
+  private resolveRT = this.createRenderTarget('Resolve')
+  private historyRT = this.createRenderTarget('History')
   private previousDepthTexture?: DepthTexture
   private readonly resolveMaterial = new NodeMaterial()
   private readonly mesh = new QuadMesh()
@@ -334,7 +335,7 @@ export class TemporalAntialiasNode extends TempNode {
   ) {
     super('vec4')
     this.updateBeforeType = NodeUpdateType.FRAME
-    this.resolveMaterial.name = 'TemporalAntialias_resolve'
+    this.resolveMaterial.name = 'TemporalAntialias [Resolve]'
     this.mesh.name = 'TemporalAntialias'
     this.projectionMatrixController = projectionMatrixController
     this.inputNode = inputNode
@@ -367,7 +368,7 @@ export class TemporalAntialiasNode extends TempNode {
     const texture = renderTarget.texture
 
     const typeName = (this.constructor as typeof Node).type.replace(/Node$/, '')
-    texture.name = name != null ? `${typeName}_${name}` : typeName
+    texture.name = name != null ? `${typeName} [${name}]` : typeName
 
     return renderTarget
   }
@@ -431,7 +432,7 @@ export class TemporalAntialiasNode extends TempNode {
     const current = this.depthNode.value
     if (this.previousDepthTexture == null) {
       this.previousDepthTexture = current.clone() as DepthTexture
-      this.previousDepthTexture.name = 'TemporalAntialias_previousDepth'
+      this.previousDepthTexture.name = 'TemporalAntialias [PreviousDepth]'
     }
     const previous = this.previousDepthTexture
 
@@ -729,7 +730,7 @@ export function temporalAntialias(...args: any[]): any {
     ): TemporalAntialiasNode =>
       new TemporalAntialiasNode(
         projectionMatrixController,
-        convertToTexture(inputNode, { name: 'TemporalAntialias_input' }),
+        convertToTexture(inputNode, { name: 'TemporalAntialias [Input]' }),
         depthNode,
         velocityNode,
         camera,
@@ -745,7 +746,7 @@ export function temporalAntialias(...args: any[]): any {
   ] = args
   return new TemporalAntialiasNode(
     highpVelocity,
-    convertToTexture(inputNode, { name: 'TemporalAntialias_input' }),
+    convertToTexture(inputNode, { name: 'TemporalAntialias [Input]' }),
     depthNode,
     velocityNode,
     camera,

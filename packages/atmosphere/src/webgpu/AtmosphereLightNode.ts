@@ -1,6 +1,6 @@
 import { Matrix3 } from 'three'
 import type { DirectLightData, LightingContext } from 'three/src/nodes/TSL.js'
-import { normalView, positionView, uniform, vec4 } from 'three/tsl'
+import { normalView, positionView, renderGroup, uniform, vec4 } from 'three/tsl'
 import {
   AnalyticLightNode,
   NodeUpdateType,
@@ -25,8 +25,8 @@ export class AtmosphereLightNode extends AnalyticLightNode<AtmosphereLight> {
 
   private atmosphereContext?: AtmosphereContext
 
-  private readonly intensity = uniform(1)
-  private readonly directionECEF = uniform('vec3')
+  private readonly intensity = uniform(1).setGroup(renderGroup)
+  private readonly directionECEF = uniform('vec3').setGroup(renderGroup)
 
   constructor(light?: AtmosphereLight | null) {
     super(light)
@@ -104,7 +104,7 @@ export class AtmosphereLightNode extends AnalyticLightNode<AtmosphereLight> {
       positionUnit,
       normalECEF,
       directionECEF
-    ).mul(indirect.select(1, 0))
+    ).mul(indirect.select(1, 0).uniformFlow())
 
     // Yes, it's an indirect but should be fine to update it here.
     const lightingContext = builder.context as unknown as LightingContext
@@ -128,7 +128,7 @@ export class AtmosphereLightNode extends AnalyticLightNode<AtmosphereLight> {
       .mul(transmittance)
       .mul(sunRadianceToLuminance.mul(luminanceScale))
       .mul(intensity)
-      .mul(direct.select(1, 0))
+      .mul(direct.select(1, 0).uniformFlow())
 
     return {
       lightDirection: directionView,

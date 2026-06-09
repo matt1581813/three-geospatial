@@ -43,7 +43,7 @@ function createRenderTarget(name: string): RenderTarget {
     type: HalfFloatType
   })
   const texture = renderTarget.texture
-  texture.name = `LongExposure_${name}`
+  texture.name = `LongExposure [${name}]`
   return renderTarget
 }
 
@@ -52,7 +52,7 @@ function createStorageTexture(name: string): StorageTexture {
   texture.type = FloatType
   texture.format = RedFormat
   texture.generateMipmaps = false
-  texture.name = `LongExposure_${name}`
+  texture.name = `LongExposure [${name}]`
   return texture
 }
 
@@ -195,6 +195,7 @@ export class LongExposureNode extends TempNode {
       .sub(this.timerNode.x)
       .lessThan(this.shutterSpeed)
       .select(max(this.inputNode, this.historyNode), this.inputNode)
+      .uniformFlow()
     material.needsUpdate = true
 
     copyMaterial.fragmentNode = this.inputNode
